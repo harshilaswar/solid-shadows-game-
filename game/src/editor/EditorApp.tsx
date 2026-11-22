@@ -63,6 +63,7 @@ import {
 } from './doc';
 import { Inspector } from './Inspector';
 import { type PlanLayers, PlanCanvas, type Sel, type Tool } from './PlanCanvas';
+import { TransformPanel } from './TransformPanel';
 
 const TOOLS: Array<{ id: Tool; name: string; key: string; icon: typeof Square }> = [
   { id: 'select', name: 'Select', key: 'V', icon: MousePointer2 },
@@ -662,6 +663,8 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
               </div>
             )}
           </div>
+
+          {view !== 'preview' && <TransformPanel doc={doc} api={api} sel={sel} />}
 
           {view !== 'preview' && (
             <div className={view === 'split' ? 'w-1/2 border-r border-[var(--line)]' : 'flex-1'}>

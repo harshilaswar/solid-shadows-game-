@@ -8,10 +8,11 @@ import {
   type DocApi,
   type Rect,
   type SelectionKind,
-  platformOutline,
   polyBounds,
   pointInPolygon,
   regularPolygon,
+  rotateDocObject,
+  moveDocObject,
   selectionCenter,
   shadowsAt,
   snapVal,
@@ -103,8 +104,8 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
   const view = useRef({ cx: 0, cz: 0, scale: 42 });
   const drag = useRef<Drag>(null);
   const dragPid = useRef<number | null>(null);
-  /** Every pointer currently down on the sheet, so a missed pointerup can never strand a drag. */
-  const activePointers = useRef<Set<number>>(new Set());
+  /** Last time the active drag saw a pointer event; used to clear dead touches quickly. */
+  const dragSeenAt = useRef(0);
   const hover = useRef<{ kind: SelectionKind; id: string } | null>(null);
   const pointer = useRef({ down: false, space: false, x: 0, y: 0 });
   const [mode, setMode] = useState<'select' | 'pan' | 'grab' | 'move'>('select');
@@ -331,138 +332,12 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
 
   /* ----------------------------------------------------------- mutate */
 
-  /**
-   * Pure: returns a copy of `base` with the selected object shifted by (dx, dz).
-   * Moving applies the CUMULATIVE drag delta to the drag-start snapshot, so the
-   * object always sits exactly at (start position + cursor delta) — a strict 1:1
-   * follow with no per-event accumulation or drift.
-   */
-  const shiftDoc = useCallback(
-    (base: Doc, kind: SelectionKind, id: string, dx: number, dz: number): Doc => {
-      if (kind === 'platform') {
-        return {
-          ...base,
-          platforms: base.platforms.map((p) => {
-            if (p.id !== id) return p;
-            return {
-              ...p,
-              xMin: p.xMin + dx,
-              xMax: p.xMax + dx,
-              zMin: p.zMin + dz,
-              zMax: p.zMax + dz,
-              points: p.points ? p.points.map((v) => ({ x: v.x + dx, z: v.z + dz })) : undefined,
-            };
-          }),
-        };
-      }
-      if (kind === 'gap') {
-        return {
-          ...base,
-          gaps: base.gaps.map((g) => {
-            if (g.id !== id) return g;
-            return { ...g, xMin: g.xMin + dx, xMax: g.xMax + dx, zMin: g.zMin + dz, zMax: g.zMax + dz, ax: g.ax + dx, az: g.az + dz, bx: g.bx + dx, bz: g.bz + dz };
-          }),
-        };
-      }
-      if (kind === 'part') {
-        return {
-          ...base,
-          pillars: base.pillars.map((s) => ({
-            ...s,
-            parts: s.parts.map((b) => (b.id !== id ? b : { ...b, xMin: b.xMin + dx, xMax: b.xMax + dx, zMin: b.zMin + dz, zMax: b.zMax + dz })),
-          })),
-        };
-      }
-      if (kind === 'pillar') {
-        return {
-          ...base,
-          pillars: base.pillars.map((s) =>
-            s.id !== id ? s : { ...s, parts: s.parts.map((b) => ({ ...b, xMin: b.xMin + dx, xMax: b.xMax + dx, zMin: b.zMin + dz, zMax: b.zMax + dz })) }
-          ),
-        };
-      }
-      return base;
-    },
-    []
-  );
-
-  /**
-   * Rotates one object in place by `angle` radians about `center`.
-   * Platforms / gaps become true outlines; casters gain a per-part yaw.
-   */
-  const rotateObject = useCallback((base: Doc, kind: SelectionKind, id: string, center: Vec2, angle: number): Doc => {
-    const cos = Math.cos(angle);
-    const sin = Math.sin(angle);
-    const rot = (v: Vec2): Vec2 => ({
-      x: center.x + (v.x - center.x) * cos - (v.z - center.z) * sin,
-      z: center.z + (v.x - center.x) * sin + (v.z - center.z) * cos,
-    });
-
-    if (kind === 'platform') {
-      return {
-        ...base,
-        platforms: base.platforms.map((p) => {
-          if (p.id !== id) return p;
-          const pts = platformOutline(p).map(rot);
-          const bb = polyBounds(pts);
-          return { ...p, points: pts, xMin: bb.xMin, xMax: bb.xMax, zMin: bb.zMin, zMax: bb.zMax };
-        }),
-      };
-    }
-
-    if (kind === 'gap') {
-      return {
-        ...base,
-        gaps: base.gaps.map((g) => {
-          if (g.id !== id) return g;
-          const corners = [
-            { x: g.xMin, z: g.zMin },
-            { x: g.xMax, z: g.zMin },
-            { x: g.xMax, z: g.zMax },
-            { x: g.xMin, z: g.zMax },
-          ].map(rot);
-          const bb = polyBounds(corners);
-          const a = rot({ x: g.ax, z: g.az });
-          const b = rot({ x: g.bx, z: g.bz });
-          return { ...g, xMin: bb.xMin, xMax: bb.xMax, zMin: bb.zMin, zMax: bb.zMax, ax: a.x, az: a.z, bx: b.x, bz: b.z };
-        }),
-      };
-    }
-
-    if (kind === 'part' || kind === 'pillar') {
-      return {
-        ...base,
-        pillars: base.pillars.map((st) => {
-          if (kind === 'pillar' ? st.id !== id : !st.parts.some((b) => b.id === id)) return st;
-          return {
-            ...st,
-            parts: st.parts.map((b) => {
-              const partCenter = { x: (b.xMin + b.xMax) / 2, z: (b.zMin + b.zMax) / 2 };
-              const moved = rot(partCenter);
-              const w = b.xMax - b.xMin;
-              const d = b.zMax - b.zMin;
-              return {
-                ...b,
-                xMin: moved.x - w / 2,
-                xMax: moved.x + w / 2,
-                zMin: moved.z - d / 2,
-                zMax: moved.z + d / 2,
-                yaw: (b.yaw ?? 0) + angle,
-              };
-            }),
-          };
-        }),
-      };
-    }
-
-    return base;
-  }, []);
-
+  /** Move any object from the drag-start snapshot by the accumulated delta. */
   const applyDelta = useCallback(
     (base: Doc, kind: SelectionKind, id: string, dx: number, dz: number) => {
-      api.live(() => shiftDoc(base, kind, id, dx, dz));
+      api.live(() => moveDocObject(base, kind, id, dx, dz));
     },
-    [api, shiftDoc]
+    [api]
   );
 
   /* ---------------------------------------------------------- handlers */
@@ -474,15 +349,13 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
    * selectable and the camera keeps drifting from a stale origin.
    */
   const finishDrag = useCallback((pointerId?: number, force = false) => {
-    if (pointerId !== undefined) activePointers.current.delete(pointerId);
-    const owner = dragPid.current;
-    const isOwner = pointerId === undefined || owner === null || owner === pointerId;
-    if (!force && !isOwner && activePointers.current.size > 0) return;
+    if (!force && pointerId !== undefined && dragPid.current !== pointerId) return;
     const d = drag.current;
     if (d?.mode === 'rotate') S.current.onRotation?.(null);
     if (d) api.endEdit();
     drag.current = null;
     dragPid.current = null;
+    dragSeenAt.current = 0;
     pointer.current.down = false;
     setMode('select');
     const cv = cvRef.current;
@@ -496,36 +369,23 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
   }, [api]);
 
   /**
-   * Drop any drag left behind by a pointer whose up/cancel never arrived.
-   * The old check trusted `activePointers` to know which pointers were alive —
-   * but that set is only cleaned by the very up event that went missing, so a
-   * single missed touch-up left a zombie drag that swallowed every later tap
-   * (nothing selectable, camera panning from a stale origin). A fresh press
-   * always wins: finish whatever is there and start clean.
+   * Drop a drag only when its owner has gone quiet for a moment. A second finger
+   * landing on the sheet is ignored while the owner is active; a pointer whose
+   * up/cancel never arrived is cleared on the next press. Much steadier than a
+   * pointer set, which only forgets a touch when the missing event finally shows.
    */
   const pruneStaleDrag = useCallback(() => {
-    if (drag.current) finishDrag(undefined, true);
-    if (activePointers.current.size > 0) activePointers.current.clear();
+    if (!drag.current) return;
+    if (performance.now() - dragSeenAt.current > 350) finishDrag(undefined, true);
   }, [finishDrag]);
 
   // Safety nets: releasing outside the window, cancelling, blurring or hiding the
   // tab all end the drag. Without these a single missed event bricks selection.
   useEffect(() => {
-    // A window-level up/cancel for the drag's own pointer ends the drag even if
-    // the canvas never saw it (capture lost, gesture taken over by the browser).
     const onWindowUp = (e: PointerEvent) => {
-      if (dragPid.current !== null && e.pointerId === dragPid.current) {
-        finishDrag(e.pointerId, true);
-      } else {
-        activePointers.current.delete(e.pointerId);
-        // No live drag but stale bookkeeping: clean it so the next press works.
-        if (!drag.current) activePointers.current.clear();
-      }
+      if (dragPid.current === e.pointerId) finishDrag(e.pointerId, true);
     };
-    const forceRelease = () => {
-      activePointers.current.clear();
-      finishDrag(undefined, true);
-    };
+    const forceRelease = () => finishDrag(undefined, true);
     const onBlur = () => {
       pointer.current.space = false;
       forceRelease();
@@ -547,19 +407,19 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       window.removeEventListener('blur', onBlur);
       window.removeEventListener('keydown', onKey);
       document.removeEventListener('visibilitychange', forceRelease);
-      activePointers.current.clear();
       drag.current = null;
       dragPid.current = null;
+      dragSeenAt.current = 0;
     };
   }, [finishDrag, setSel]);
 
   const onDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    // A fresh press always wins. If a previous drag's pointerup never arrived
-    // (touch cancel, browser gesture, lost capture), its drag is dead — finish
-    // it now instead of letting it swallow this tap. This sheet has no pinch
-    // gesture, so a second finger restarting the gesture is harmless.
+    // Clear a dead touch from the owner that never sent pointerup. If the owner
+    // is still active, extra fingers are ignored instead of cancelling its gesture.
     pruneStaleDrag();
-    activePointers.current.add(e.pointerId);
+    if (drag.current) return;
+    e.preventDefault();
+    dragSeenAt.current = performance.now();
 
     const cv = cvRef.current!;
     try {
@@ -702,6 +562,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
     // second finger (palm, resting thumb) must never yank the camera or the
     // object — that was the "viewport jumps on every touch" bug.
     if (d && dragPid.current !== null && e.pointerId !== dragPid.current) return;
+    if (d) dragSeenAt.current = performance.now();
 
     if (!d) {
       const hit = hitTest(e.clientX, e.clientY, e.pointerType);
@@ -744,7 +605,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       const dy = e.clientY - d.py;
       // Fingers wobble more than a mouse: demand a longer deliberate drag
       // before a touch becomes a pan, so taps never nudge the sheet.
-      const threshold = e.pointerType === 'touch' ? 8 : 4;
+      const threshold = e.pointerType === 'touch' ? 12 : 4;
       if (Math.hypot(dx, dy) < threshold) return; // still a tap, not a pan
       // Pan by the accumulated delta right away so the sheet follows the
       // finger 1:1 with no one-frame jump, then track incrementally.
@@ -769,7 +630,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         delta = Math.round(delta / step) * step;
       }
       S.current.onRotation?.(Math.round((delta * 180) / Math.PI));
-      api.live(() => rotateObject(d.before, d.kind, d.id, d.center, delta));
+      api.live(() => rotateDocObject(d.before, d.kind, d.id, delta));
       return;
     }
     if (d.mode === 'vertex') {

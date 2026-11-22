@@ -13,6 +13,7 @@ import {
   centerOf,
   deleteDocObject,
   norm,
+  moveDocObject,
   pad,
   platformOutline,
   polyBounds,
@@ -415,6 +416,9 @@ export function Inspector({
       if (platform) patchRect('platform', platform.id, { xMin: platform.xMin + dx, xMax: platform.xMax + dx, zMin: platform.zMin + dz, zMax: platform.zMax + dz });
       else if (gap) patchRect('gap', gap.id, { xMin: gap.xMin + dx, xMax: gap.xMax + dx, zMin: gap.zMin + dz, zMax: gap.zMax + dz });
       else if (part) patchRect('part', part.id, { xMin: part.xMin + dx, xMax: part.xMax + dx, zMin: part.zMin + dz, zMax: part.zMax + dz });
+      else if (sel.kind !== 'none' && sel.kind !== 'sun' && sel.kind !== 'anchorA' && sel.kind !== 'anchorB') {
+        update((d) => moveDocObject(d, sel.kind, sel.id, dx, dz), 'nudge object');
+      }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);

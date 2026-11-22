@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { LevelData, Vec2 } from '../game/types';
+import type { LevelData, Vec2, Vec3 } from '../game/types';
 import {
   isCrystalEclipsed,
   isGapBridged,
@@ -23,6 +23,8 @@ export interface PlatformItem {
   brokenEdges: Edge[];
   /** Optional outline (world space). Present for polygons; rects derive corners on demand. */
   points?: Vec2[];
+  /** Yaw in radians about the object centre. Preserved across edits/rotation. */
+  yaw?: number;
 }
 
 export interface BoxItem {
@@ -56,6 +58,8 @@ export interface GapItem {
   az: number;
   bx: number;
   bz: number;
+  /** Yaw in radians about the span centre. */
+  yaw?: number;
 }
 
 export interface CrystalItem {
@@ -465,7 +469,7 @@ export function rotateDocObject(base: Doc, kind: string, id: string, angle: numb
         if (p.id !== id) return p;
         const pts = platformOutline(p).map(rot);
         const bb = polyBounds(pts);
-        return { ...p, points: pts, xMin: bb.xMin, xMax: bb.xMax, zMin: bb.zMin, zMax: bb.zMax };
+        return { ...p, points: pts, xMin: bb.xMin, xMax: bb.xMax, zMin: bb.zMin, zMax: bb.zMax, yaw: (p.yaw ?? 0) + angle };
       }),
     };
   }
@@ -485,7 +489,7 @@ export function rotateDocObject(base: Doc, kind: string, id: string, angle: numb
         );
         const a = rot({ x: g.ax, z: g.az });
         const b = rot({ x: g.bx, z: g.bz });
-        return { ...g, xMin: bb.xMin, xMax: bb.xMax, zMin: bb.zMin, zMax: bb.zMax, ax: a.x, az: a.z, bx: b.x, bz: b.z };
+        return { ...g, xMin: bb.xMin, xMax: bb.xMax, zMin: bb.zMin, zMax: bb.zMax, ax: a.x, az: a.z, bx: b.x, bz: b.z, yaw: (g.yaw ?? 0) + angle };
       }),
     };
   }
@@ -506,6 +510,389 @@ export function rotateDocObject(base: Doc, kind: string, id: string, angle: numb
           }),
         };
       }),
+    };
+  }
+
+  return base;
+}
+
+/** Shifts any selectable object by a world-space delta. */
+export function moveDocObject(base: Doc, kind: string, id: string, dx: number, dz: number): Doc {
+  if (kind === 'platform') {
+    return {
+      ...base,
+      platforms: base.platforms.map((p) => {
+        if (p.id !== id) return p;
+        return {
+          ...p,
+          xMin: p.xMin + dx,
+          xMax: p.xMax + dx,
+          zMin: p.zMin + dz,
+          zMax: p.zMax + dz,
+          points: p.points ? p.points.map((v) => ({ x: v.x + dx, z: v.z + dz })) : undefined,
+        };
+      }),
+    };
+  }
+  if (kind === 'gap') {
+    return {
+      ...base,
+      gaps: base.gaps.map((g) =>
+        g.id !== id
+          ? g
+          : {
+              ...g,
+              xMin: g.xMin + dx,
+              xMax: g.xMax + dx,
+              zMin: g.zMin + dz,
+              zMax: g.zMax + dz,
+              ax: g.ax + dx,
+              az: g.az + dz,
+              bx: g.bx + dx,
+              bz: g.bz + dz,
+            }
+      ),
+    };
+  }
+  if (kind === 'part') {
+    return {
+      ...base,
+      pillars: base.pillars.map((s) => ({
+        ...s,
+        parts: s.parts.map((b) =>
+          b.id !== id ? b : { ...b, xMin: b.xMin + dx, xMax: b.xMax + dx, zMin: b.zMin + dz, zMax: b.zMax + dz }
+        ),
+      })),
+    };
+  }
+  if (kind === 'pillar') {
+    return {
+      ...base,
+      pillars: base.pillars.map((s) =>
+        s.id !== id
+          ? s
+          : {
+              ...s,
+              parts: s.parts.map((b) => ({ ...b, xMin: b.xMin + dx, xMax: b.xMax + dx, zMin: b.zMin + dz, zMax: b.zMax + dz })),
+            }
+      ),
+    };
+  }
+  if (kind === 'crystal') {
+    return {
+      ...base,
+      crystals: base.crystals.map((c) => (c.id === id ? { ...c, x: c.x + dx, z: c.z + dz } : c)),
+    };
+  }
+  if (kind === 'start' || kind === 'goal') {
+    return { ...base, [kind]: { x: base[kind].x + dx, z: base[kind].z + dz } } as Doc;
+  }
+  if (kind === 'sun') {
+    const sp = sunPoint(base);
+    const nx = sp.x + dx;
+    const nz = sp.z + dz;
+    if (Math.hypot(nx, nz) < 1e-6) return base;
+    return { ...base, sun: { ...base.sun, azimuth: azimuthOf(nx, nz) } };
+  }
+  return base;
+}
+
+export interface OptionalVec3 {
+  x: number | null;
+  y: number | null;
+  z: number | null;
+}
+
+export interface ObjectTransform {
+  kind: SelectionKind | 'sun';
+  id: string;
+  name: string;
+  kindLabel: string;
+  position: Vec3;
+  /** Degrees, or null when yaw has no meaning for this object. */
+  rotationDeg: number | null;
+  /** World-space dimensions. Null cells are not applicable (yet editable objects never fail). */
+  size: OptionalVec3;
+  canMoveY: boolean;
+  canRotate: boolean;
+  canScaleX: boolean;
+  canScaleY: boolean;
+  canScaleZ: boolean;
+}
+
+const deg = (rad: number) => ((rad * 180) / Math.PI + 360) % 360;
+const rad = (degrees: number) => (degrees * Math.PI) / 180;
+const centerOfBox = (b: BoxItem): Vec3 => ({ x: (b.xMin + b.xMax) / 2, y: (b.yMin + b.yMax) / 2, z: (b.zMin + b.zMax) / 2 });
+const boxSize = (b: BoxItem): Vec3 => ({ x: b.xMax - b.xMin, y: b.yMax - b.yMin, z: b.zMax - b.zMin });
+const bboxOfBoxes = (boxes: BoxItem[]) => {
+  let xMin = Infinity;
+  let xMax = -Infinity;
+  let yMin = Infinity;
+  let yMax = -Infinity;
+  let zMin = Infinity;
+  let zMax = -Infinity;
+  for (const b of boxes) {
+    xMin = Math.min(xMin, b.xMin);
+    xMax = Math.max(xMax, b.xMax);
+    yMin = Math.min(yMin, b.yMin);
+    yMax = Math.max(yMax, b.yMax);
+    zMin = Math.min(zMin, b.zMin);
+    zMax = Math.max(zMax, b.zMax);
+  }
+  return { xMin, xMax, yMin, yMax, zMin, zMax };
+};
+const firstPartYaw = (parts: BoxItem[]) => parts.find((b) => Number.isFinite(b.yaw))?.yaw ?? 0;
+const nullMetrics = { size: { x: null, y: null, z: null }, canMoveY: false, canRotate: false, canScaleX: false, canScaleY: false, canScaleZ: false };
+
+/** Everything the transform panel needs to describe a selection in world units/degrees. */
+export function transformOf(doc: Doc, kind: string, id: string): ObjectTransform | null {
+  if (kind === 'platform') {
+    const p = doc.platforms.find((v) => v.id === id);
+    if (!p) return null;
+    const r = norm(p);
+    return {
+      kind: 'platform',
+      id,
+      name: p.name,
+      kindLabel: 'Stone',
+      position: { x: (r.xMin + r.xMax) / 2, y: 0, z: (r.zMin + r.zMax) / 2 },
+      rotationDeg: deg(p.yaw ?? 0),
+      size: { x: r.xMax - r.xMin, y: null, z: r.zMax - r.zMin },
+      canMoveY: false,
+      canRotate: true,
+      canScaleX: true,
+      canScaleY: false,
+      canScaleZ: true,
+    };
+  }
+  if (kind === 'gap') {
+    const g = doc.gaps.find((v) => v.id === id);
+    if (!g) return null;
+    const r = norm(g);
+    return {
+      kind: 'gap',
+      id,
+      name: g.name,
+      kindLabel: 'Broken span',
+      position: { x: (r.xMin + r.xMax) / 2, y: 0, z: (r.zMin + r.zMax) / 2 },
+      rotationDeg: deg(g.yaw ?? 0),
+      size: { x: r.xMax - r.xMin, y: null, z: r.zMax - r.zMin },
+      canMoveY: false,
+      canRotate: true,
+      canScaleX: true,
+      canScaleY: false,
+      canScaleZ: true,
+    };
+  }
+  if (kind === 'part' || kind === 'pillar') {
+    for (const s of doc.pillars) {
+      if (kind === 'pillar' && s.id !== id) continue;
+      const parts = kind === 'pillar' ? s.parts : s.parts.filter((b) => b.id === id);
+      if (parts.length === 0) continue;
+      const bb = bboxOfBoxes(parts);
+      return {
+        kind,
+        id,
+        name: kind === 'pillar' ? s.label : `${s.label} block`,
+        kindLabel: kind === 'pillar' ? 'Caster' : 'Caster block',
+        position: { x: (bb.xMin + bb.xMax) / 2, y: (bb.yMin + bb.yMax) / 2, z: (bb.zMin + bb.zMax) / 2 },
+        rotationDeg: deg(firstPartYaw(parts)),
+        size: { x: bb.xMax - bb.xMin, y: bb.yMax - bb.yMin, z: bb.zMax - bb.zMin },
+        canMoveY: true,
+        canRotate: true,
+        canScaleX: true,
+        canScaleY: true,
+        canScaleZ: true,
+      };
+    }
+    return null;
+  }
+  if (kind === 'crystal') {
+    const c = doc.crystals.find((v) => v.id === id);
+    if (!c) return null;
+    return {
+      kind: 'crystal',
+      id,
+      name: 'Sun crystal',
+      kindLabel: 'Crystal',
+      position: { x: c.x, y: 0, z: c.z },
+      rotationDeg: null,
+      size: { x: c.radius * 2, y: c.radius * 2, z: c.radius * 2 },
+      canMoveY: false,
+      canRotate: false,
+      canScaleX: true,
+      canScaleY: false,
+      canScaleZ: true,
+    };
+  }
+  if (kind === 'start' || kind === 'goal') {
+    const p = doc[kind];
+    return {
+      kind,
+      id: kind,
+      name: kind === 'start' ? 'Sphere start' : 'Sanctuary goal',
+      kindLabel: kind === 'start' ? 'Start' : 'Goal',
+      position: { x: p.x, y: 0, z: p.z },
+      rotationDeg: null,
+      size: { x: null, y: null, z: null },
+      canMoveY: false,
+      canRotate: false,
+      canScaleX: false,
+      canScaleY: false,
+      canScaleZ: false,
+    };
+  }
+  if (kind === 'sun') {
+    const sp = sunPoint(doc);
+    return {
+      kind: 'sun',
+      id: 'sun',
+      name: 'The light',
+      kindLabel: 'Light',
+      position: { x: sp.x, y: doc.sun.y, z: sp.z },
+      rotationDeg: doc.sun.azimuth,
+      ...nullMetrics,
+    };
+  }
+  return null;
+}
+
+/** Set the world-space centre of any object. Sun X/Z steer its bearing instead of teleporting it. */
+export function setObjectPosition(base: Doc, kind: string, id: string, pos: Partial<Vec3>): Doc {
+  const info = transformOf(base, kind, id);
+  if (!info) return base;
+  let next = base;
+  if (pos.x !== undefined || pos.z !== undefined) {
+    next = moveDocObject(next, kind, id, (pos.x ?? info.position.x) - info.position.x, (pos.z ?? info.position.z) - info.position.z);
+  }
+  if (pos.y !== undefined) {
+    const dy = pos.y - info.position.y;
+    if (Math.abs(dy) > 1e-9) {
+      if (kind === 'part' || kind === 'pillar') {
+        next = {
+          ...next,
+          pillars: next.pillars.map((s) =>
+            kind === 'pillar' && s.id !== id ? s : { ...s, parts: s.parts.map((b) => (kind === 'part' && b.id !== id ? b : { ...b, yMin: b.yMin + dy, yMax: b.yMax + dy })) }
+          ),
+        };
+      } else if (kind === 'sun') {
+        next = { ...next, sun: { ...next.sun, y: pos.y } };
+      }
+    }
+  }
+  return next;
+}
+
+/** Rotate any object to an absolute yaw, in degrees. The light maps to sun azimuth. */
+export function setObjectYaw(base: Doc, kind: string, id: string, yawDeg: number): Doc {
+  if (kind === 'sun') return { ...base, sun: { ...base.sun, azimuth: ((yawDeg % 360) + 360) % 360 } };
+  const info = transformOf(base, kind, id);
+  if (!info || info.rotationDeg === null) return base;
+  const delta = rad(yawDeg - info.rotationDeg);
+  if (Math.abs(delta) < 1e-12) return base;
+  return rotateDocObject(base, kind, id, delta);
+}
+
+const scaleBoxAround = (b: BoxItem, center: Vec3, sx: number, sy: number, sz: number): BoxItem => {
+  const c = centerOfBox(b);
+  const nc = {
+    x: center.x + (c.x - center.x) * sx,
+    y: center.y + (c.y - center.y) * sy,
+    z: center.z + (c.z - center.z) * sz,
+  };
+  const s = boxSize(b);
+  return {
+    ...b,
+    xMin: nc.x - (s.x * sx) / 2,
+    xMax: nc.x + (s.x * sx) / 2,
+    yMin: nc.y - (s.y * sy) / 2,
+    yMax: nc.y + (s.y * sy) / 2,
+    zMin: nc.z - (s.z * sz) / 2,
+    zMax: nc.z + (s.z * sz) / 2,
+  };
+};
+
+/** Set world-space dimensions in place. Platforms/spans scale X/Z; casters scale X/Y/Z; crystals scale radius uniformly. */
+export function setObjectSize(base: Doc, kind: string, id: string, size: Partial<Vec3>): Doc {
+  const info = transformOf(base, kind, id);
+  if (!info) return base;
+  const center = info.position;
+  const cur = info.size;
+  const sx = size.x !== undefined && cur.x ? size.x / cur.x : 1;
+  const sz = size.z !== undefined && cur.z ? size.z / cur.z : 1;
+
+  if (kind === 'platform') {
+    return {
+      ...base,
+      platforms: base.platforms.map((p) => {
+        if (p.id !== id) return p;
+        if (p.points && p.points.length >= 3) {
+          const pts = p.points.map((v) => ({ x: center.x + (v.x - center.x) * sx, z: center.z + (v.z - center.z) * sz }));
+          const bb = polyBounds(pts);
+          return { ...p, points: pts, xMin: bb.xMin, xMax: bb.xMax, zMin: bb.zMin, zMax: bb.zMax };
+        }
+        const w = size.x ?? cur.x ?? 0;
+        const d = size.z ?? cur.z ?? 0;
+        return { ...p, xMin: center.x - w / 2, xMax: center.x + w / 2, zMin: center.z - d / 2, zMax: center.z + d / 2 };
+      }),
+    };
+  }
+
+  if (kind === 'gap') {
+    return {
+      ...base,
+      gaps: base.gaps.map((g) =>
+        g.id !== id
+          ? g
+          : {
+              ...g,
+              xMin: center.x + (g.xMin - center.x) * sx,
+              xMax: center.x + (g.xMax - center.x) * sx,
+              zMin: center.z + (g.zMin - center.z) * sz,
+              zMax: center.z + (g.zMax - center.z) * sz,
+              ax: center.x + (g.ax - center.x) * sx,
+              az: center.z + (g.az - center.z) * sz,
+              bx: center.x + (g.bx - center.x) * sx,
+              bz: center.z + (g.bz - center.z) * sz,
+            }
+      ),
+    };
+  }
+
+  if (kind === 'part' || kind === 'pillar') {
+    if (kind === 'part') {
+      return {
+        ...base,
+        pillars: base.pillars.map((s) => ({
+          ...s,
+          parts: s.parts.map((b) => {
+            if (b.id !== id) return b;
+            const ns = boxSize(b);
+            const w = size.x ?? ns.x;
+            const h = size.y ?? ns.y;
+            const d = size.z ?? ns.z;
+            const c = centerOfBox(b);
+            return { ...b, xMin: c.x - w / 2, xMax: c.x + w / 2, yMin: c.y - h / 2, yMax: c.y + h / 2, zMin: c.z - d / 2, zMax: c.z + d / 2 };
+          }),
+        })),
+      };
+    }
+    const cy = center.y;
+    const sy = size.y !== undefined && cur.y ? size.y / cur.y : 1;
+    return {
+      ...base,
+      pillars: base.pillars.map((s) =>
+        s.id !== id ? s : { ...s, parts: s.parts.map((b) => scaleBoxAround(b, { x: center.x, y: cy, z: center.z }, sx, sy, sz)) }
+      ),
+    };
+  }
+
+  if (kind === 'crystal') {
+    const nextDiameter = size.x ?? size.z;
+    if (nextDiameter === undefined) return base;
+    return {
+      ...base,
+      crystals: base.crystals.map((c) => (c.id === id ? { ...c, radius: Math.max(0.05, nextDiameter / 2) } : c)),
     };
   }
 
