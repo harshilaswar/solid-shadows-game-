@@ -9,6 +9,7 @@ import {
   FilePlus2,
   Hexagon,
   RotateCw,
+  SkipForward,
   Grid3x3,
   Hand,
   Keyboard,
@@ -200,6 +201,38 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
     [doc]
   );
 
+  /** Tool buttons double as a reset for selection gestures, so placement cannot inherit a stuck selection. */
+  const chooseTool = useCallback((next: Tool) => {
+    setTool(next);
+    if (next !== 'select') {
+      setSel({ kind: 'none', id: '' });
+      setVertexMode(false);
+    }
+  }, []);
+
+  /** Tab walks every selectable thing, including objects hidden under other objects. */
+  const cycleSelection = useCallback(
+    (dir: 1 | -1) => {
+      const items: Sel[] = [
+        ...doc.platforms.map((p) => ({ kind: 'platform', id: p.id }) as Sel),
+        ...doc.gaps.map((g) => ({ kind: 'gap', id: g.id }) as Sel),
+        ...doc.pillars.flatMap((s) => [
+          { kind: 'pillar', id: s.id } as Sel,
+          ...s.parts.map((b) => ({ kind: 'part', id: b.id }) as Sel),
+        ]),
+        ...doc.crystals.map((c) => ({ kind: 'crystal', id: c.id }) as Sel),
+        { kind: 'start', id: 'start' },
+        { kind: 'goal', id: 'goal' },
+        { kind: 'sun', id: 'sun' },
+      ];
+      if (items.length === 0) return;
+      const current = items.findIndex((i) => i.kind === sel.kind && i.id === sel.id);
+      const next = current < 0 ? (dir === 1 ? 0 : items.length - 1) : (current + dir + items.length) % items.length;
+      setSel(items[next]);
+    },
+    [doc, sel]
+  );
+
   const previewDoc = useDebounced(doc, 420);
   const previewLevel = useMemo(() => toLevelData(previewDoc), [previewDoc]);
   const playLevelData = useMemo(() => (playLevel ? toLevelData(playLevel) : null), [playLevel]);
@@ -339,6 +372,11 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
         flash('Saved to this browser');
         return;
       }
+      if (e.key === 'Tab' && !mod) {
+        e.preventDefault();
+        cycleSelection(e.shiftKey ? -1 : 1);
+        return;
+      }
       if (e.key === 'Escape') {
         if (playLevel) {
           setPlayLevel(null);
@@ -360,7 +398,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
       const k = e.key.toLowerCase();
       const t = TOOLS.find((x) => x.key.toLowerCase() === k);
       if (t && !mod) {
-        setTool(t.id);
+        chooseTool(t.id);
         return;
       }
       if (k === 'f') setFitSignal((n) => n + 1);
@@ -387,7 +425,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [api, modal, playLevel, runAnalysis, storeNow]);
+  }, [api, modal, playLevel, runAnalysis, storeNow, chooseTool, cycleSelection]);
 
   const importJson = () => {
     try {
@@ -517,7 +555,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
               className="fg-tool"
               onClick={() => {
                 sound.playUiClick();
-                setTool(t.id);
+                chooseTool(t.id);
               }}
               title={`${t.name}  ·  ${t.key}`}
             >
@@ -592,6 +630,13 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
               <span className="forge-label small px-1.5">
                 {sel.kind === 'none' ? 'Nothing selected' : sel.kind}
               </span>
+              <button
+                className="fg-btn fg-icon"
+                title="Cycle to the next object (Tab)"
+                onClick={() => cycleSelection(1)}
+              >
+                <SkipForward className="h-3.5 w-3.5" />
+              </button>
               <span className="h-4 w-px bg-[var(--line)]" />
               <button
                 className="fg-btn fg-icon"
@@ -985,6 +1030,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
               ['A', 'solve: sweep all bearings'],
               ['R / Y', 'swing light +15° / −15°'],
               ['Arrows', 'nudge selection (shift ×10)'],
+              ['Tab / ⇧Tab', 'cycle every object'],
               ['⌫ / D', 'delete / duplicate'],
               ['⌘Z / ⇧⌘Z', 'undo / redo'],
               ['⌘S', 'store in this browser'],
