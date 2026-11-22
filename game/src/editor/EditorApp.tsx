@@ -303,10 +303,16 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
     [api, doc.platforms, sel]
   );
 
+  const rotationless = (k: typeof sel.kind) => k === 'none' || k === 'start' || k === 'goal' || k === 'crystal';
+
   const rotateSelection = useCallback(
     (deg: number) => {
       if (sel.kind === 'none') {
         flash('Select an object first');
+        return;
+      }
+      if (rotationless(sel.kind)) {
+        flash('That marker has no rotation');
         return;
       }
       if (sel.kind === 'sun') {
@@ -642,7 +648,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
                 className="fg-btn fg-icon"
                 title="Rotate 15° left  ( [ )"
                 onClick={() => rotateSelection(-15)}
-                disabled={sel.kind === 'none' || sel.kind === 'sun'}
+                disabled={sel.kind === 'none' || sel.kind === 'sun' || sel.kind === 'start' || sel.kind === 'goal' || sel.kind === 'crystal'}
               >
                 <RotateCw className="h-3.5 w-3.5 scale-x-[-1]" />
               </button>
@@ -650,7 +656,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
                 className="fg-btn fg-icon"
                 title="Rotate 15° right  ( ] )"
                 onClick={() => rotateSelection(15)}
-                disabled={sel.kind === 'none' || sel.kind === 'sun'}
+                disabled={sel.kind === 'none' || sel.kind === 'sun' || sel.kind === 'start' || sel.kind === 'goal' || sel.kind === 'crystal'}
               >
                 <RotateCw className="h-3.5 w-3.5" />
               </button>

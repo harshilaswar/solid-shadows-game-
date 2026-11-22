@@ -88,10 +88,13 @@ interface Props {
 type Drag =
   | { mode: 'pan'; px: number; py: number }
   | { mode: 'maybePan'; px: number; py: number }
-  | { mode: 'move'; kind: SelectionKind; id: string; wx: number; wz: number; before: Doc }
+  | { mode: 'maybeMove'; kind: SelectionKind; id: string; wx: number; wz: number; cx: number; cy: number; before: Doc }
+  | { mode: 'move'; kind: SelectionKind; id: string; wx: number; wz: number; lx: number; lz: number; before: Doc }
   | { mode: 'resize'; id: string; rect: 'platform' | 'part' | 'gap'; handle: string; start: Rect }
-  | { mode: 'anchor'; id: string; which: 'a' | 'b' }
-  | { mode: 'point'; kind: 'crystal' | 'start' | 'goal'; id: string }
+  | { mode: 'maybeAnchor'; id: string; which: 'a' | 'b'; ox: number; oz: number; cx: number; cy: number }
+  | { mode: 'anchor'; id: string; which: 'a' | 'b'; ox: number; oz: number; lx: number; lz: number }
+  | { mode: 'maybePoint'; kind: 'crystal' | 'start' | 'goal'; id: string; ox: number; oz: number; cx: number; cy: number }
+  | { mode: 'point'; kind: 'crystal' | 'start' | 'goal'; id: string; ox: number; oz: number; lx: number; lz: number }
   | { mode: 'create'; type: 'platform' | 'pillar' | 'gap' | 'polygon'; ax: number; az: number; bx: number; bz: number }
   | { mode: 'vertex'; kind: 'platform'; id: string; index: number; before: Doc }
   | { mode: 'rotate'; kind: SelectionKind; id: string; center: Vec2; startAngle: number; before: Doc }
@@ -270,7 +273,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       if (sr) {
         const rx = (sr.xMin + sr.xMax) / 2;
         const rz = sr.zMin - 42 / v.scale;
-        if (Math.hypot(rx - w.x, rz - w.z) < (isTouch ? 24 : 12) / v.scale) {
+        if (Math.hypot(rx - w.x, rz - w.z) < (isTouch ? 16 : 10) / v.scale) {
           return { kind: S.current.sel.kind, id: S.current.sel.id, handle: 'rotate', r: 0 };
         }
       }
@@ -340,6 +343,26 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return null;
     },
     [handlesOf, rectOf, toWorld]
+  );
+
+  /** Snap a move delta once, at release. Works for rects and point markers alike. */
+  const snappedDeltaFor = useCallback(
+    (kind: SelectionKind, id: string, base: Doc, dx: number, dz: number) => {
+      const g = S.current.grid;
+      const snv = (v: number) => (g > 0 ? Math.round(v / g) * g : v);
+      const b = rectOf(kind, id, base);
+      if (b) {
+        const ndx = snv(b.xMin + dx) - b.xMin;
+        const ndz = snv(b.zMin + dz) - b.zMin;
+        return { dx: ndx, dz: ndz, moved: true };
+      }
+      let origin: { x: number; z: number } | null = null;
+      if (kind === 'crystal') origin = base.crystals.find((c) => c.id === id) ?? null;
+      else if (kind === 'start' || kind === 'goal') origin = base[kind];
+      if (!origin) return { dx, dz, moved: false };
+      return { dx: snv(origin.x + dx) - origin.x, dz: snv(origin.z + dz) - origin.z, moved: true };
+    },
+    [rectOf]
   );
 
   /* ----------------------------------------------------------- mutate */
@@ -465,20 +488,17 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
     }
     if (t === 'crystal') {
       const id = uid('c');
-      api.beginEdit();
       api.commit(
         { ...doc, crystals: [...doc.crystals, { id, x: sn(w.x), z: sn(w.z), radius: 0.42 }] },
-);
-      api.endEdit();
+        'add crystal'
+      );
       setSel({ kind: 'crystal', id });
       // stay armed for dropping several crystals; V / Esc returns to Select
       return;
     }
     if (t === 'start' || t === 'goal') {
       const key = t === 'start' ? 'start' : 'goal';
-      api.beginEdit();
-      api.commit({ ...doc, [key]: { x: sn(w.x), z: sn(w.z) } } as Doc);
-      api.endEdit();
+      api.commit({ ...doc, [key]: { x: sn(w.x), z: sn(w.z) } } as Doc, `place ${t}`);
       setSel({ kind: t, id: t });
       setTool('select');
       return;
@@ -535,7 +555,10 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return;
     }
     if (hit.kind === 'anchorA' || hit.kind === 'anchorB') {
-      drag.current = { mode: 'anchor', id: hit.id, which: hit.kind === 'anchorA' ? 'a' : 'b' };
+      const g = doc.gaps.find((v) => v.id === hit.id);
+      const which = hit.kind === 'anchorA' ? 'a' : 'b';
+      const ap = which === 'a' ? { x: g?.ax ?? 0, z: g?.az ?? 0 } : { x: g?.bx ?? 0, z: g?.bz ?? 0 };
+      drag.current = { mode: 'maybeAnchor', id: hit.id, which, ox: ap.x - w.x, oz: ap.z - w.z, cx: e.clientX, cy: e.clientY };
       dragPid.current = e.pointerId;
       api.beginEdit();
       setSel({ kind: 'gap', id: hit.id });
@@ -549,7 +572,10 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return;
     }
     if (hit.kind === 'start' || hit.kind === 'goal' || hit.kind === 'crystal') {
-      drag.current = { mode: 'point', kind: hit.kind, id: hit.id };
+      let pos = { x: 0, z: 0 };
+      if (hit.kind === 'crystal') pos = doc.crystals.find((c) => c.id === hit.id) ?? pos;
+      else pos = doc[hit.kind];
+      drag.current = { mode: 'maybePoint', kind: hit.kind, id: hit.id, ox: pos.x - w.x, oz: pos.z - w.z, cx: e.clientX, cy: e.clientY };
       dragPid.current = e.pointerId;
       api.beginEdit();
       setSel({ kind: hit.kind, id: hit.id });
@@ -559,7 +585,18 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
     const isPart = hit.kind === 'part';
     const targetId = isPart ? pillarIdOfPart(doc, hit.id) : hit.id;
     setSel({ kind: hit.kind, id: hit.id });
-    drag.current = { mode: 'move', kind: hit.kind, id: isPart ? hit.id : targetId, wx: w.x, wz: w.z, before: doc };
+    // A tap must select, never nudge: arm a pending drag and only engage the
+    // object once the pointer travels a few screen pixels past the press point.
+    drag.current = {
+      mode: 'maybeMove',
+      kind: hit.kind,
+      id: isPart ? hit.id : targetId,
+      wx: w.x,
+      wz: w.z,
+      cx: e.clientX,
+      cy: e.clientY,
+      before: doc,
+    };
     dragPid.current = e.pointerId;
     api.beginEdit();
     setMode('move');
@@ -663,19 +700,20 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       api.live((doc0) => ({ ...doc0, sun: { ...doc0.sun, azimuth: Math.round(azimuthOf(w.x, w.z) * 10) / 10 } }));
       return;
     }
+    if (d.mode === 'maybeMove') {
+      const threshold = e.pointerType === 'touch' ? 12 : 6;
+      if (Math.hypot(e.clientX - d.cx, e.clientY - d.cy) <= threshold) return;
+      // engage: promote the pending tap into a real drag that follows 1:1
+      drag.current = { mode: 'move', kind: d.kind, id: d.id, wx: d.wx, wz: d.wz, lx: w.x, lz: w.z, before: d.before };
+      applyDelta(d.before, d.kind, d.id, w.x - d.wx, w.z - d.wz);
+      return;
+    }
     if (d.mode === 'move') {
       // 1:1 follow: total cursor delta since press, applied to the drag-start doc.
-      let dx = w.x - d.wx;
-      let dz = w.z - d.wz;
-      if (S.current.snap && S.current.grid > 0 && !e.altKey) {
-        // snap against the object's ORIGINAL rect so the delta stays stable
-        const b = rectOf(d.kind, d.id, d.before);
-        if (b) {
-          dx = sn(b.xMin + dx) - b.xMin;
-          dz = sn(b.zMin + dz) - b.zMin;
-        }
-      }
-      applyDelta(d.before, d.kind, d.id, dx, dz);
+      // Snapping is deferred to release so a drag never sticks or jumps mid-gesture.
+      d.lx = w.x;
+      d.lz = w.z;
+      applyDelta(d.before, d.kind, d.id, w.x - d.wx, w.z - d.wz);
       return;
     }
     if (d.mode === 'resize') {
@@ -704,9 +742,21 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       });
       return;
     }
+    if (d.mode === 'maybePoint' || d.mode === 'maybeAnchor') {
+      const threshold = e.pointerType === 'touch' ? 12 : 6;
+      if (Math.hypot(e.clientX - d.cx, e.clientY - d.cy) <= threshold) return;
+      if (d.mode === 'maybePoint') {
+        drag.current = { mode: 'point', kind: d.kind, id: d.id, ox: d.ox, oz: d.oz, lx: w.x, lz: w.z };
+      } else {
+        drag.current = { mode: 'anchor', id: d.id, which: d.which, ox: d.ox, oz: d.oz, lx: w.x, lz: w.z };
+      }
+      return;
+    }
     if (d.mode === 'anchor') {
-      const x = sn(w.x);
-      const z = sn(w.z);
+      d.lx = w.x;
+      d.lz = w.z;
+      const x = w.x + d.ox;
+      const z = w.z + d.oz;
       api.live((doc0) => ({
         ...doc0,
         gaps: doc0.gaps.map((g) => (g.id === d.id ? { ...g, ...(d.which === 'a' ? { ax: x, az: z } : { bx: x, bz: z }) } : g)),
@@ -714,8 +764,10 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return;
     }
     if (d.mode === 'point') {
-      const x = sn(w.x);
-      const z = sn(w.z);
+      d.lx = w.x;
+      d.lz = w.z;
+      const x = w.x + d.ox;
+      const z = w.z + d.oz;
       api.live((doc0) => {
         if (d.kind === 'crystal') {
           return { ...doc0, crystals: doc0.crystals.map((c) => (c.id === d.id ? { ...c, x, z } : c)) };
@@ -736,8 +788,35 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       finishDrag(e.pointerId);
       return;
     }
+    if (d.mode === 'anchor' && S.current.snap && S.current.grid > 0 && !e.altKey) {
+      const which = d.which;
+      const fx = sn(d.lx + d.ox);
+      const fz = sn(d.lz + d.oz);
+      api.live((doc0) => ({
+        ...doc0,
+        gaps: doc0.gaps.map((g) => (g.id === d.id ? { ...g, ...(which === 'a' ? { ax: fx, az: fz } : { bx: fx, bz: fz }) } : g)),
+      }));
+    }
+    if (d.mode === 'point' && S.current.snap && S.current.grid > 0 && !e.altKey) {
+      const fx = sn(d.lx + d.ox);
+      const fz = sn(d.lz + d.oz);
+      const kind = d.kind;
+      const id = d.id;
+      api.live((doc0) => {
+        if (kind === 'crystal') {
+          return { ...doc0, crystals: doc0.crystals.map((c) => (c.id === id ? { ...c, x: fx, z: fz } : c)) };
+        }
+        return { ...doc0, [kind]: { x: fx, z: fz } } as Doc;
+      });
+    }
+    if (d.mode === 'move' && S.current.snap && S.current.grid > 0 && !e.altKey) {
+      const rawDx = d.lx - d.wx;
+      const rawDz = d.lz - d.wz;
+      const snapped = snappedDeltaFor(d.kind, d.id, d.before, rawDx, rawDz);
+      if (snapped.moved) applyDelta(d.before, d.kind, d.id, snapped.dx, snapped.dz);
+    }
     finishDrag(e.pointerId, true);
-    if (d.mode === 'maybePan' || d.mode === 'pan') return;
+    if (d.mode === 'maybePan' || d.mode === 'pan' || d.mode === 'maybeMove' || d.mode === 'maybePoint' || d.mode === 'maybeAnchor') return;
 
     if (d.mode === 'create' && d.type === 'polygon') {
       const radius = Math.max(0.7, Math.hypot(d.bx - d.ax, d.bz - d.az));
@@ -745,25 +824,26 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       const pts = regularPolygon(d.ax, d.az, radius, sides);
       const bb = polyBounds(pts);
       const id = uid('p');
-      api.beginEdit();
-      api.commit({
-        ...doc,
-        platforms: [
-          ...doc.platforms,
-          {
-            id,
-            name: `${sides}-gon ${doc.platforms.length + 1}`,
-            xMin: bb.xMin,
-            xMax: bb.xMax,
-            zMin: bb.zMin,
-            zMax: bb.zMax,
-            style: 'main',
-            brokenEdges: [],
-            points: pts,
-          },
-        ],
-      });
-      api.endEdit();
+      api.commit(
+        {
+          ...doc,
+          platforms: [
+            ...doc.platforms,
+            {
+              id,
+              name: `${sides}-gon ${doc.platforms.length + 1}`,
+              xMin: bb.xMin,
+              xMax: bb.xMax,
+              zMin: bb.zMin,
+              zMax: bb.zMax,
+              style: 'main',
+              brokenEdges: [],
+              points: pts,
+            },
+          ],
+        },
+        'add polygon stone'
+      );
       setSel({ kind: 'platform', id });
       // keep the stone tool armed so more stones can be placed; V / Esc exits
       return;
@@ -776,7 +856,6 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         // accidental tap: stay in the placement tool instead of throwing the user back to Select
         return;
       }
-      api.beginEdit();
       if (d.type === 'platform') {
         const id = uid('p');
         api.commit(
@@ -786,7 +865,6 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
           },
           'add platform'
         );
-        api.endEdit();
         setSel({ kind: 'platform', id });
       } else if (d.type === 'gap') {
         const id = uid('g');
@@ -810,7 +888,6 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
           },
           'add span'
         );
-        api.endEdit();
         setSel({ kind: 'gap', id });
       } else {
         const id = uid('pil');
@@ -842,7 +919,6 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
           },
           'add caster'
         );
-        api.endEdit();
         setSel({ kind: 'part', id: partId });
       }
       // keep the drawing tool armed for rapid placement; V / Esc returns to Select
@@ -1404,7 +1480,6 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         onPointerMove={onMove}
         onPointerUp={onUp}
         onPointerCancel={onUp}
-        onLostPointerCapture={(e) => finishDrag(e.pointerId, true)}
         onContextMenu={(e) => e.preventDefault()}
       />
       {tool !== 'select' && (
