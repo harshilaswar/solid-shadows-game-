@@ -166,6 +166,18 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
     fit();
   }, [fitSignal, fit]);
 
+  // Switching to a placement tool ends any in-flight selection gesture. Without
+  // this, a finger still down from moving/selecting the last object keeps that
+  // drag as the gesture owner and the new tool appears to ignore the canvas.
+  useEffect(() => {
+    if (tool === 'select') return;
+    const owner = dragPid.current;
+    if (drag.current) finishDrag(owner ?? undefined, true);
+    hover.current = null;
+    setMode('select');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tool]);
+
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
@@ -250,7 +262,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       // Fingers are fat: give touch roughly double the mouse tolerance so taps
       // actually land on handles and small markers instead of missing them.
       const isTouch = pointerType === 'touch';
-      const tol = (isTouch ? 14 : 7) / v.scale;
+      const tol = (isTouch ? 17 : 7) / v.scale;
 
       const sr = rectOf(S.current.sel.kind, S.current.sel.id);
 
@@ -258,7 +270,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       if (sr) {
         const rx = (sr.xMin + sr.xMax) / 2;
         const rz = sr.zMin - 42 / v.scale;
-        if (Math.hypot(rx - w.x, rz - w.z) < (isTouch ? 20 : 12) / v.scale) {
+        if (Math.hypot(rx - w.x, rz - w.z) < (isTouch ? 24 : 12) / v.scale) {
           return { kind: S.current.sel.kind, id: S.current.sel.id, handle: 'rotate', r: 0 };
         }
       }
@@ -268,7 +280,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         const poly = S.current.doc.platforms.find((p) => p.id === S.current.sel.id);
         if (poly?.points && poly.points.length >= 3) {
           for (let i = 0; i < poly.points.length; i++) {
-            if (Math.hypot(poly.points[i].x - w.x, poly.points[i].z - w.z) < (isTouch ? 16 : 10) / v.scale) {
+            if (Math.hypot(poly.points[i].x - w.x, poly.points[i].z - w.z) < (isTouch ? 18 : 10) / v.scale) {
               return { kind: 'platform', id: poly.id, handle: `v${i}`, r: 0 };
             }
           }
@@ -287,7 +299,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
 
       // sun
       const sp = sunPoint(d);
-      if (Math.hypot(sp.x - w.x, sp.z - w.z) < 1.15) return { kind: 'sun', id: 'sun', r: 0 };
+      if (Math.hypot(sp.x - w.x, sp.z - w.z) < (isTouch ? 1.45 : 1.15)) return { kind: 'sun', id: 'sun', r: 0 };
 
       // gap anchors
       for (const g of d.gaps) {
@@ -296,13 +308,13 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       }
 
       // markers
-      const markR = isTouch ? 0.85 : 0.62;
+      const markR = isTouch ? 0.95 : 0.62;
       if (Math.hypot(d.goal.x - w.x, d.goal.z - w.z) < markR) return { kind: 'goal', id: 'goal', r: 0 };
       if (Math.hypot(d.start.x - w.x, d.start.z - w.z) < markR) return { kind: 'start', id: 'start', r: 0 };
 
       for (let i = d.crystals.length - 1; i >= 0; i--) {
         const c = d.crystals[i];
-        const crystalR = isTouch ? Math.max(c.radius + 0.35, 0.7) : Math.max(c.radius + 0.2, 0.5);
+        const crystalR = isTouch ? Math.max(c.radius + 0.4, 0.85) : Math.max(c.radius + 0.2, 0.5);
         if (Math.hypot(c.x - w.x, c.z - w.z) < crystalR) {
           return { kind: 'crystal', id: c.id, r: 0 };
         }
@@ -459,7 +471,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
 );
       api.endEdit();
       setSel({ kind: 'crystal', id });
-      setTool('select');
+      // stay armed for dropping several crystals; V / Esc returns to Select
       return;
     }
     if (t === 'start' || t === 'goal') {
@@ -753,7 +765,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       });
       api.endEdit();
       setSel({ kind: 'platform', id });
-      setTool('select');
+      // keep the stone tool armed so more stones can be placed; V / Esc exits
       return;
     }
     if (d.mode === 'create') {
@@ -761,7 +773,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       const w = r.xMax - r.xMin;
       const dep = r.zMax - r.zMin;
       if (w < 0.35 && dep < 0.35) {
-        setTool('select');
+        // accidental tap: stay in the placement tool instead of throwing the user back to Select
         return;
       }
       api.beginEdit();
@@ -831,9 +843,9 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
           'add caster'
         );
         api.endEdit();
-        setSel({ kind: 'part', id: doc.pillars.at(-1)?.parts[0]?.id ?? '' });
+        setSel({ kind: 'part', id: partId });
       }
-      setTool('select');
+      // keep the drawing tool armed for rapid placement; V / Esc returns to Select
       return;
     }
   };
@@ -1397,14 +1409,14 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       />
       {tool !== 'select' && (
         <div className="pointer-events-none absolute left-1/2 top-3 -translate-x-1/2 bg-[#2f3336] px-3 py-1.5 text-[10.5px] uppercase tracking-[0.18em] text-[#f0e9da]">
-          {tool === 'platform' && 'Drag a rectangle for stone'}
-          {tool === 'polygon' && `Drag out a ${polygonSides}-sided stone (3–12 sides in the header)`}
-          {tool === 'pillar' && 'Drag a footprint for a caster'}
-          {tool === 'gap' && 'Drag the broken span'}
-          {tool === 'crystal' && 'Click to set a sun crystal'}
+          {tool === 'platform' && 'Drag a rectangle for stone · Esc ends'}
+          {tool === 'polygon' && `Drag out a ${polygonSides}-sided stone · Esc ends`}
+          {tool === 'pillar' && 'Drag a footprint for a caster · Esc ends'}
+          {tool === 'gap' && 'Drag the broken span · Esc ends'}
+          {tool === 'crystal' && 'Click to set sun crystals · Esc ends'}
           {tool === 'start' && 'Click to place the sphere'}
           {tool === 'goal' && 'Click to place the sanctuary'}
-          {tool === 'sun' && 'Drag to swing the light'}
+          {tool === 'sun' && 'Drag to swing the light · Esc ends'}
         </div>
       )}
     </div>
