@@ -286,7 +286,7 @@ export function Inspector({
   // history labels are accepted for readability; the doc hook snapshots on every commit
   const update = (fn: (d: Doc) => Doc, _label?: string) => api.update(fn);
 
-  const setPoint = (key: 'start' | 'goal', patch: { x?: number; z?: number }) =>
+  const setPoint = (key: 'start' | 'goal', patch: { x?: number; y?: number; z?: number }) =>
     update((d) => ({ ...d, [key]: { ...d[key], ...patch } } as Doc));
 
   type Patch = Record<string, number | boolean | string>;
@@ -308,6 +308,7 @@ export function Inspector({
   const platform = sel.kind === 'platform' ? doc.platforms.find((p) => p.id === sel.id) : undefined;
   const gap = sel.kind === 'gap' ? doc.gaps.find((g) => g.id === sel.id) : undefined;
   const crystal = sel.kind === 'crystal' ? doc.crystals.find((c) => c.id === sel.id) : undefined;
+  const ramp = sel.kind === 'ramp' ? (doc.ramps ?? []).find((r) => r.id === sel.id) : undefined;
   let part: Doc['pillars'][number]['parts'][number] | undefined;
   let pillar: Doc['pillars'][number] | undefined;
   for (const s of doc.pillars) {
@@ -323,6 +324,7 @@ export function Inspector({
     if (platform) update((d) => ({ ...d, platforms: d.platforms.filter((p) => p.id !== sel.id) }), 'delete platform');
     else if (gap) update((d) => ({ ...d, gaps: d.gaps.filter((g) => g.id !== sel.id) }), 'delete span');
     else if (crystal) update((d) => ({ ...d, crystals: d.crystals.filter((c) => c.id !== sel.id) }), 'delete crystal');
+    else if (ramp) update((d) => deleteDocObject(d, 'ramp', sel.id), 'delete ramp');
     else if (part)
       update(
         (d) => ({
@@ -369,6 +371,16 @@ export function Inspector({
         'duplicate'
       );
       setSel({ kind: 'gap', id });
+    } else if (ramp) {
+      const id = uid('r');
+      update(
+        (d) => ({
+          ...d,
+          ramps: [...(d.ramps ?? []), { ...ramp, id, name: `${ramp.name} copy`, x: ramp.x + off, z: ramp.z + off }],
+        }),
+        'duplicate'
+      );
+      setSel({ kind: 'ramp', id });
     } else if (part && pillar) {
       const id = uid('b');
       update(
@@ -448,7 +460,9 @@ export function Inspector({
                         ? 'Caster block'
                         : sel.kind === 'gap'
                           ? 'Broken span'
-                          : 'Stone platform'
+                          : sel.kind === 'ramp'
+                            ? 'Walkway ramp'
+                            : 'Stone platform'
         }
         right={
           rectKind && activeRect ? (
@@ -476,6 +490,12 @@ export function Inspector({
               api={api}
               onChange={(v) => setPoint(sel.kind as 'start' | 'goal', { z: v })}
             />
+            <Num
+              label="y"
+              value={sel.kind === 'start' ? doc.start.y ?? 0 : doc.goal.y ?? 0}
+              api={api}
+              onChange={(v) => setPoint(sel.kind as 'start' | 'goal', { y: v })}
+            />
             <div className="mt-2 flex gap-1.5">
               <Btn
                 onClick={() => {
@@ -483,7 +503,7 @@ export function Inspector({
                   const p = doc.platforms[0];
                   if (!p) return;
                   const c = centerOf(norm(p));
-                  update((d) => ({ ...d, [key]: c } as Doc), `centre ${key}`);
+                  update((d) => ({ ...d, [key]: { ...d[key], ...c } } as Doc), `centre ${key}`);
                 }}
                 title="Drop onto the centre of the first platform"
               >
@@ -498,6 +518,7 @@ export function Inspector({
             <Num label="x" value={crystal.x} api={api} onChange={(v) => update((d) => ({ ...d, crystals: d.crystals.map((c) => (c.id === crystal.id ? { ...c, x: v } : c)) }))} />
             <Num label="z" value={crystal.z} api={api} onChange={(v) => update((d) => ({ ...d, crystals: d.crystals.map((c) => (c.id === crystal.id ? { ...c, z: v } : c)) }))} />
             <Num label="eclipse radius" value={crystal.radius} step={0.05} min={0.1} api={api} onChange={(v) => update((d) => ({ ...d, crystals: d.crystals.map((c) => (c.id === crystal.id ? { ...c, radius: v } : c)) }))} />
+            <Num label="y" value={crystal.y ?? 0} api={api} onChange={(v) => update((d) => ({ ...d, crystals: d.crystals.map((c) => (c.id === crystal.id ? { ...c, y: v } : c)) }))} />
             <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--muted)]">
               While any shadow covers this point the goal stays sealed.
             </p>
@@ -524,6 +545,7 @@ export function Inspector({
               ]}
               onChange={(v) => update((d) => ({ ...d, platforms: d.platforms.map((p) => (p.id === platform.id ? { ...p, style: v } : p)) }))}
             />
+            <Num label="elevation y" value={platform.y ?? 0} api={api} onChange={(v) => update((d) => ({ ...d, platforms: d.platforms.map((p) => (p.id === platform.id ? { ...p, y: v } : p)) }))} />
             <div className="py-1.5">
               <span className="forge-label">Broken edges</span>
               <div className="mt-1.5 flex flex-wrap gap-1">
@@ -837,6 +859,7 @@ export function Inspector({
               <Num label="x to" value={gap.xMax} api={api} onChange={(v) => patchRect('gap', gap.id, { xMax: v })} />
               <Num label="z from" value={gap.zMin} api={api} onChange={(v) => patchRect('gap', gap.id, { zMin: v })} />
               <Num label="z to" value={gap.zMax} api={api} onChange={(v) => patchRect('gap', gap.id, { zMax: v })} />
+              <Num label="elevation y" value={gap.y ?? 0} api={api} onChange={(v) => patchRect('gap', gap.id, { y: v })} />
             </div>
             <div className="mt-2 border-t border-[var(--line-soft)] pt-2">
               <span className="forge-label">Span test anchors</span>
@@ -902,6 +925,31 @@ export function Inspector({
           </>
         )}
 
+        {ramp && (
+          <>
+            <label className="block py-1.5">
+              <span className="forge-label">Name</span>
+              <input className="fg-text mt-1" value={ramp.name} onChange={(e) => update((d) => ({ ...d, ramps: (d.ramps ?? []).map((r) => (r.id === ramp.id ? { ...r, name: e.target.value } : r)) }))} />
+            </label>
+            <div className="grid grid-cols-2 gap-x-3">
+              <Num label="x" value={ramp.x} api={api} onChange={(v) => update((d) => ({ ...d, ramps: (d.ramps ?? []).map((r) => (r.id === ramp.id ? { ...r, x: v } : r)) }))} />
+              <Num label="z" value={ramp.z} api={api} onChange={(v) => update((d) => ({ ...d, ramps: (d.ramps ?? []).map((r) => (r.id === ramp.id ? { ...r, z: v } : r)) }))} />
+              <Num label="low y" value={ramp.y} api={api} onChange={(v) => update((d) => ({ ...d, ramps: (d.ramps ?? []).map((r) => (r.id === ramp.id ? { ...r, y: v } : r)) }))} />
+              <Num label="rise" value={ramp.rise} step={0.1} api={api} onChange={(v) => update((d) => ({ ...d, ramps: (d.ramps ?? []).map((r) => (r.id === ramp.id ? { ...r, rise: v } : r)) }))} />
+              <Num label="length" value={ramp.length} min={0.5} api={api} onChange={(v) => update((d) => ({ ...d, ramps: (d.ramps ?? []).map((r) => (r.id === ramp.id ? { ...r, length: Math.max(0.5, v) } : r)) }))} />
+              <Num label="width" value={ramp.width} min={0.3} api={api} onChange={(v) => update((d) => ({ ...d, ramps: (d.ramps ?? []).map((r) => (r.id === ramp.id ? { ...r, width: Math.max(0.3, v) } : r)) }))} />
+              <Num label="yaw" value={(ramp.yaw * 180) / Math.PI} step={5} suffix="°" api={api} onChange={(v) => update((d) => ({ ...d, ramps: (d.ramps ?? []).map((r) => (r.id === ramp.id ? { ...r, yaw: (v * Math.PI) / 180 } : r)) }))} />
+            </div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--muted)]">
+              The ball rolls up from the low side to the high side; the high edge lands at low y + rise. Drag the ramp on the sheet to move it, or use the Transform panel for exact values.
+            </p>
+            <RotateRow
+              label="Rotate ramp"
+              onRotate={(deg) => update((d) => rotateDocObject(d, 'ramp', ramp.id, (deg * Math.PI) / 180))}
+            />
+          </>
+        )}
+
         {sel.kind === 'sun' && (
           <>
             <Num label="bearing" value={doc.sun.azimuth} step={1} api={api} onChange={(v) => update((d) => ({ ...d, sun: { ...d.sun, azimuth: ((v % 360) + 360) % 360 } }))} suffix="°" />
@@ -915,6 +963,17 @@ export function Inspector({
         )}
 
         {rectKind && activeRect && (
+          <div className="mt-3 flex gap-1.5 border-t border-[var(--line-soft)] pt-3">
+            <Btn onClick={duplicate}>
+              <Copy className="h-3.5 w-3.5" /> Duplicate
+            </Btn>
+            <Btn danger onClick={deleteSelected}>
+              <Trash2 className="h-3.5 w-3.5" /> Delete
+            </Btn>
+          </div>
+        )}
+
+        {ramp && (
           <div className="mt-3 flex gap-1.5 border-t border-[var(--line-soft)] pt-3">
             <Btn onClick={duplicate}>
               <Copy className="h-3.5 w-3.5" /> Duplicate
@@ -964,6 +1023,15 @@ export function Inspector({
                 </span>
           </button>
         ))}
+        {(doc.ramps ?? []).map((r) => (
+          <button key={r.id} className="fg-row w-full text-left" data-on={sel.id === r.id} onClick={() => setSel({ kind: 'ramp', id: r.id })}>
+            <span className="flex items-center gap-2 text-[12px]">
+              <span className="forge-mono text-[10px] leading-none text-[var(--amber)]">◢</span>
+              {r.name}
+            </span>
+            <span className="forge-mono text-[9.5px] text-[var(--muted)]">+{round(r.rise, 1)} over {round(r.length, 1)}</span>
+          </button>
+        ))}
         {doc.crystals.length > 0 &&
           doc.crystals.map((c) => (
             <button key={c.id} className="fg-row w-full text-left" data-on={sel.id === c.id} onClick={() => setSel({ kind: 'crystal', id: c.id })}>
@@ -1002,7 +1070,7 @@ export function Inspector({
       </Section>
 
       {/* framing */}
-      <Section title="Framing" right={<span className="forge-mono text-[9.5px] text-[var(--muted)]">{counts.platforms}p · {counts.pillars}c · {counts.gaps}g</span>}>
+      <Section title="Framing" right={<span className="forge-mono text-[9.5px] text-[var(--muted)]">{counts.platforms}p · {counts.pillars}c · {counts.gaps}g · {counts.ramps ?? 0}r</span>}>
         <div className="grid grid-cols-2 gap-x-3">
           <Num label="cam x" value={doc.camera.ox} step={0.5} api={api} onChange={(v) => update((d) => ({ ...d, camera: { ...d.camera, ox: v } }))} />
           <Num label="cam y" value={doc.camera.oy} step={0.5} api={api} onChange={(v) => update((d) => ({ ...d, camera: { ...d.camera, oy: v } }))} />
@@ -1070,15 +1138,16 @@ function onUpdateAll(api: DocApi, grid: number, snapOn: boolean) {
     const s = (v: number) => snapVal(v, grid);
     return {
       ...d,
-      platforms: d.platforms.map((p) => ({ ...p, xMin: s(p.xMin), xMax: s(p.xMax), zMin: s(p.zMin), zMax: s(p.zMax) })),
-      gaps: d.gaps.map((g) => ({ ...g, xMin: s(g.xMin), xMax: s(g.xMax), zMin: s(g.zMin), zMax: s(g.zMax), ax: s(g.ax), az: s(g.az), bx: s(g.bx), bz: s(g.bz) })),
+      platforms: d.platforms.map((p) => ({ ...p, xMin: s(p.xMin), xMax: s(p.xMax), zMin: s(p.zMin), zMax: s(p.zMax), y: p.y === undefined ? undefined : s(p.y) })),
+      gaps: d.gaps.map((g) => ({ ...g, xMin: s(g.xMin), xMax: s(g.xMax), zMin: s(g.zMin), zMax: s(g.zMax), ax: s(g.ax), az: s(g.az), bx: s(g.bx), bz: s(g.bz), y: g.y === undefined ? undefined : s(g.y) })),
+      ramps: (d.ramps ?? []).map((r) => ({ ...r, x: s(r.x), z: s(r.z), y: s(r.y) })),
       pillars: d.pillars.map((p) => ({
         ...p,
         parts: p.parts.map((b) => ({ ...b, xMin: s(b.xMin), xMax: s(b.xMax), zMin: s(b.zMin), zMax: s(b.zMax), yMin: s(b.yMin), yMax: s(b.yMax) })),
       })),
-      crystals: d.crystals.map((c) => ({ ...c, x: s(c.x), z: s(c.z) })),
-      start: { x: s(d.start.x), z: s(d.start.z) },
-      goal: { x: s(d.goal.x), z: s(d.goal.z) },
+      crystals: d.crystals.map((c) => ({ ...c, x: s(c.x), z: s(c.z), y: c.y === undefined ? undefined : s(c.y) })),
+      start: { ...d.start, x: s(d.start.x), z: s(d.start.z), y: d.start.y === undefined ? undefined : s(d.start.y) },
+      goal: { ...d.goal, x: s(d.goal.x), z: s(d.goal.z), y: d.goal.y === undefined ? undefined : s(d.goal.y) },
     };
   });
 }

@@ -19,6 +19,7 @@ import {
   Magnet,
   MousePointer2,
   PanelRight,
+  TrendingUp,
   Play,
   Redo2,
   Save,
@@ -72,6 +73,7 @@ const TOOLS: Array<{ id: Tool; name: string; key: string; icon: typeof Square }>
   { id: 'polygon', name: 'N-gon', key: 'O', icon: Hexagon },
   { id: 'pillar', name: 'Caster', key: 'C', icon: Box },
   { id: 'gap', name: 'Span', key: 'G', icon: Eraser },
+  { id: 'ramp', name: 'Ramp', key: 'T', icon: TrendingUp },
   { id: 'crystal', name: 'Crystal', key: 'X', icon: Circle },
   { id: 'start', name: 'Start', key: 'B', icon: Target },
   { id: 'goal', name: 'Goal', key: 'E', icon: Link },
@@ -197,7 +199,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
 
   const issues = useMemo(() => validate(doc), [doc]);
   const counts = useMemo(
-    () => ({ platforms: doc.platforms.length, pillars: doc.pillars.length, gaps: doc.gaps.length, crystals: doc.crystals.length }),
+    () => ({ platforms: doc.platforms.length, pillars: doc.pillars.length, gaps: doc.gaps.length, crystals: doc.crystals.length, ramps: (doc.ramps ?? []).length }),
     [doc]
   );
 
@@ -221,6 +223,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
           ...s.parts.map((b) => ({ kind: 'part', id: b.id }) as Sel),
         ]),
         ...doc.crystals.map((c) => ({ kind: 'crystal', id: c.id }) as Sel),
+        ...(doc.ramps ?? []).map((r) => ({ kind: 'ramp', id: r.id }) as Sel),
         { kind: 'start', id: 'start' },
         { kind: 'goal', id: 'goal' },
         { kind: 'sun', id: 'sun' },
@@ -239,7 +242,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
   const footprint = useMemo(() => shadowFootprint(doc), [doc]);
 
   // invalidate analysis whenever the shape of the level changes
-  const shapeKey = useMemo(() => JSON.stringify([doc.platforms, doc.pillars, doc.gaps, doc.crystals, doc.start, doc.goal, doc.sun.shadowRatio]), [doc]);
+  const shapeKey = useMemo(() => JSON.stringify([doc.platforms, doc.pillars, doc.gaps, doc.crystals, doc.ramps, doc.start, doc.goal, doc.sun.shadowRatio]), [doc]);
   useEffect(() => {
     setAnalysis(null);
     cancelRef.current = true;
@@ -327,7 +330,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
 
   const deleteSelection = useCallback(() => {
     if (sel.kind === 'none' || sel.kind === 'sun') {
-      flash('Select a platform, caster, span or crystal to delete');
+      flash('Select a platform, caster, span, ramp or crystal to delete');
       return;
     }
     api.update((d) => deleteDocObject(d, sel.kind, sel.id));
@@ -824,7 +827,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
           {readout || 'cursor —'}
         </span>
         <span className="forge-mono hidden text-[9.5px] text-[var(--muted)] md:inline">
-          {counts.platforms} stone · {counts.pillars} casters · {counts.gaps} spans · {counts.crystals} crystals
+          {counts.platforms} stone · {counts.pillars} casters · {counts.gaps} spans · {counts.ramps} ramps · {counts.crystals} crystals
         </span>
         <span className="forge-mono hidden text-[9.5px] text-[var(--muted)] md:inline">umbra area {footprint.toFixed(1)} u²</span>
         <span className="forge-mono hidden text-[9.5px] text-[var(--muted)] md:inline">ratio {doc.sun.shadowRatio.toFixed(2)}</span>
@@ -1028,7 +1031,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
           <div className="grid grid-cols-2 gap-x-6">
             {[
               ['V / P / C / G', 'select · stone · caster · span'],
-              ['X / B / E / L', 'crystal · start · goal · light'],
+              ['T / X / B / E / L', 'ramp · crystal · start · goal · light'],
               ['Drag', 'create or move · alt = free'],
               ['Wheel', 'zoom · space-drag to pan'],
               ['F', 'fit sheet to the level'],

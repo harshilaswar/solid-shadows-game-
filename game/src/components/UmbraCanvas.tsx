@@ -8,11 +8,16 @@ import {
 import { createNatureUniforms, createPhysicalUmbraMaterial } from '../game/natureShaders';
 import { SANCTUARY_PALETTES } from '../game/palettes';
 import {
-  checkPointSupport,
+  distanceToConvexPolygon,
+  distanceToPolygon,
+  distanceToRamp,
+  distanceToRect,
   isCrystalEclipsed,
   isGapBridged,
-  projectBoxShadowToGround,
+  projectBoxShadowToPlane,
+  rampHeightAt,
   resolveCircleRectCollision,
+  resolveCircleRotRectCollision,
   sunShadowOffsetPerHeight,
   traceUmbraSilhouette,
 } from '../game/shadowMath';
@@ -63,6 +68,98 @@ interface UmbraCanvasProps {
 }
 
 const BALL_RADIUS = 0.32;
+
+interface SupportHit {
+  height: number;
+  dist: number;
+  source: 'platform' | 'shadow' | 'ramp';
+  onShadow: boolean;
+  rampYaw?: number;
+  rampSlope?: number;
+}
+
+interface SupportEvaluation {
+  best: SupportHit | null;
+  /** Flat/ramp surfaces above the ball's feet — these behave as walls. */
+  walls: SupportHit[];
+}
+
+/** 2D containment platforms need (footprint test shared by spawn & support). */
+const footprintDist = (shape: { xMin: number; xMax: number; zMin: number; zMax: number; points?: Vec2[] }, x: number, z: number): number =>
+  shape.points && shape.points.length >= 3 ? distanceToPolygon({ x, z }, shape.points) : distanceToRect({ x, z }, shape);
+
+/**
+ * Finds every surface containing (x, z) — stone tops, solidified shadow bridges on their own
+ * planes, and ramps — and sorts them into what the ball can stand on right now (at or below
+ * its feet, highest first) and what must block it as a wall (above its feet).
+ */
+const evaluateSupport = (
+  x: number,
+  z: number,
+  bottom: number,
+  platforms: LevelData['platforms'],
+  gaps: LevelData['brokenGaps'],
+  ramps: LevelData['ramps'] | undefined,
+  bridged: boolean[],
+  shadowsByPlane: Map<number, Vec2[][]>,
+  forgiveness = 0.14
+): SupportEvaluation => {
+  const hits: SupportHit[] = [];
+  for (const p of platforms) {
+    const d = footprintDist(p, x, z);
+    if (d <= forgiveness) {
+      hits.push({ height: p.y ?? 0, dist: Math.max(0, d), source: 'platform', onShadow: false });
+    }
+  }
+  gaps.forEach((g, i) => {
+    if (!bridged[i]) return;
+    const gy = g.y ?? 0;
+    for (const poly of shadowsByPlane.get(gy) ?? []) {
+      const d = distanceToConvexPolygon({ x, z }, poly);
+      if (d <= forgiveness) {
+        hits.push({ height: gy, dist: Math.max(0, d), source: 'shadow', onShadow: true });
+      }
+    }
+  });
+  for (const r of ramps ?? []) {
+    if (rampHeightAt(r, x, z, forgiveness) === null) continue;
+    hits.push({
+      height: rampHeightAt(r, x, z, forgiveness) as number,
+      dist: Math.max(0, distanceToRamp(r, { x, z })),
+      source: 'ramp',
+      onShadow: false,
+      rampYaw: r.yaw,
+      rampSlope: r.length > 1e-6 ? r.rise / r.length : 0,
+    });
+  }
+  const sourceRank = (s: SupportHit) => (s.source === 'platform' ? 0 : s.source === 'ramp' ? 1 : 2);
+  const below = hits.filter((c) => c.height <= bottom + 0.02);
+  below.sort((a, b) => b.height - a.height || sourceRank(a) - sourceRank(b));
+  const walls = hits.filter((c) => c.height > bottom + 0.02 && c.source !== 'shadow');
+  return { best: below[0] ?? null, walls };
+};
+
+/** Highest walkable surface at/near a point — used for spawn & respawn placement. */
+const spawnSurfaceHeight = (
+  x: number,
+  z: number,
+  platforms: LevelData['platforms'],
+  ramps: LevelData['ramps'] | undefined,
+  fallbackY: number
+): number => {
+  let best: number | null = null;
+  for (const p of platforms) {
+    if (footprintDist(p, x, z) <= 0.14) {
+      const py = p.y ?? 0;
+      if (best === null || py > best) best = py;
+    }
+  }
+  for (const r of ramps ?? []) {
+    const h = rampHeightAt(r, x, z, 0.14);
+    if (h !== null && (best === null || h > best)) best = h;
+  }
+  return best ?? fallbackY;
+};
 
 export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
   level,
@@ -117,18 +214,19 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
     lightTarget: Vec3;
     lightDirty: boolean;
     shadows: Vec2[][];
+    shadowsByPlane: Map<number, Vec2[][]>;
     bridgedFlags: boolean[];
     eclipsed: boolean;
     draggingPlane: 'none' | 'sky' | 'ground';
     dragOffset: Vec2;
     hoveringSun: boolean;
   }>({
-    ballPos: new THREE.Vector3(level.start.x, BALL_RADIUS, level.start.z),
+    ballPos: new THREE.Vector3(level.start.x, spawnSurfaceHeight(level.start.x, level.start.z, level.platforms, level.ramps, level.start.y ?? 0) + BALL_RADIUS, level.start.z),
     ballVel: { x: 0, z: 0 },
     ballVy: 0,
     splashed: false,
     ballQuat: new THREE.Quaternion(),
-    lastSafePos: { ...level.start },
+    lastSafePos: { x: level.start.x, z: level.start.z, y: spawnSurfaceHeight(level.start.x, level.start.z, level.platforms, level.ramps, level.start.y ?? 0) },
     falling: false,
     fallTimer: 0,
     won: false,
@@ -138,6 +236,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
     lightTarget: { ...level.lightInitial },
     lightDirty: true,
     shadows: [],
+    shadowsByPlane: new Map(),
     bridgedFlags: [],
     eclipsed: false,
     draggingPlane: 'none',
@@ -148,12 +247,12 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
   // Reset ball to level start when resetSignal increments
   useEffect(() => {
     const s = simRef.current;
-    s.ballPos.set(level.start.x, BALL_RADIUS + 0.42, level.start.z);
+    s.ballPos.set(level.start.x, spawnSurfaceHeight(level.start.x, level.start.z, level.platforms, level.ramps, level.start.y ?? 0) + BALL_RADIUS + 0.42, level.start.z);
     s.ballVel = { x: 0, z: 0 };
     s.ballVy = 0;
     s.splashed = false;
     s.ballQuat.identity();
-    s.lastSafePos = { ...level.start };
+    s.lastSafePos = { x: level.start.x, z: level.start.z, y: spawnSurfaceHeight(level.start.x, level.start.z, level.platforms, level.ramps, level.start.y ?? 0) };
     s.falling = false;
     s.fallTimer = 0;
     s.won = false;
@@ -199,12 +298,12 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
     v.rotating = false;
 
     const sim = simRef.current;
-    sim.ballPos.set(level.start.x, BALL_RADIUS + 0.42, level.start.z);
+    sim.ballPos.set(level.start.x, spawnSurfaceHeight(level.start.x, level.start.z, level.platforms, level.ramps, level.start.y ?? 0) + BALL_RADIUS + 0.42, level.start.z);
     sim.ballVel = { x: 0, z: 0 };
     sim.ballVy = 0;
     sim.splashed = false;
     sim.ballQuat.identity();
-    sim.lastSafePos = { ...level.start };
+    sim.lastSafePos = { x: level.start.x, z: level.start.z, y: spawnSurfaceHeight(level.start.x, level.start.z, level.platforms, level.ramps, level.start.y ?? 0) };
     sim.falling = false;
     sim.fallTimer = 0;
     sim.won = false;
@@ -221,6 +320,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
     }
     sim.lightDirty = true;
     sim.shadows = [];
+    sim.shadowsByPlane = new Map();
     sim.bridgedFlags = level.brokenGaps.map(() => false);
     sim.eclipsed = false;
     sim.draggingPlane = 'none';
@@ -477,7 +577,8 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
       depth: number,
       material: THREE.Material | THREE.Material[],
       yTop: number,
-      castShadow = false
+      castShadow = false,
+      parent: THREE.Group | THREE.Scene = levelGroup
     ) => {
       const shape = new THREE.Shape();
       shape.moveTo(pts[0].x, -pts[0].z);
@@ -489,7 +590,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
       mesh.position.y = yTop - depth;
       mesh.receiveShadow = true;
       mesh.castShadow = castShadow;
-      levelGroup.add(mesh);
+      parent.add(mesh);
       return mesh;
     };
 
@@ -512,6 +613,10 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
     };
 
     for (const plat of level.platforms) {
+      const platY = plat.y ?? 0;
+      const platGroup = new THREE.Group();
+      platGroup.position.y = platY;
+      levelGroup.add(platGroup);
       const w = plat.xMax - plat.xMin;
       const d = plat.zMax - plat.zMin;
       const cx = (plat.xMin + plat.xMax) * 0.5;
@@ -537,16 +642,18 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
 
       if (outline.length >= 3) {
         // --- polygon stone: top slab, stepped cliff body, plinth, inlay, fractured spurs
-        slabFromOutline(outline, 0.14, platTopMat, 0, true);
-        slabFromOutline(shrinkOutline(outline, 0.06), 0.58, matStoneSide, -0.14);
-        slabFromOutline(shrinkOutline(outline, 0.2), 0.44, matStoneDeep, -0.72);
+        slabFromOutline(outline, 0.14, platTopMat, 0, true, platGroup);
+        slabFromOutline(shrinkOutline(outline, 0.06), 0.58, matStoneSide, -0.14, false, platGroup);
+        slabFromOutline(shrinkOutline(outline, 0.2), 0.44, matStoneDeep, -0.72, false, platGroup);
+        // support cliff running from the plinth down into the flooded chasm (always rooted at world -2.36)
+        slabFromOutline(shrinkOutline(outline, 0.34), Math.max(0, platY) + 1.2, matStoneDeep, -1.16, false, platGroup);
 
         // inset inlay copied inward from every edge midpoint
         const inset = shrinkOutline(outline, 0.22);
         const pts = inset.map((q) => new THREE.Vector3(q.x, 0.004, q.z));
         const loopGeo = track(new THREE.BufferGeometry().setFromPoints(pts));
         const loop = new THREE.LineLoop(loopGeo, matInlayLine);
-        levelGroup.add(loop);
+        platGroup.add(loop);
 
         if ((plat.brokenEdges || []).length > 0) {
           // small fractured spurs sitting on the outline's corners
@@ -559,7 +666,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
             spur.position.set(q.x, -0.05, q.z);
             spur.rotation.y = idx * 0.7;
             spur.receiveShadow = true;
-            levelGroup.add(spur);
+            platGroup.add(spur);
           });
         }
       } else {
@@ -569,21 +676,30 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         topMesh.position.set(cx, -0.07, cz);
         topMesh.receiveShadow = true;
         topMesh.castShadow = true;
-        levelGroup.add(topMesh);
+        platGroup.add(topMesh);
 
         const bodyGeo = track(new THREE.BoxGeometry(Math.max(0.2, w - 0.1), 0.58, Math.max(0.2, d - 0.1)));
         const bodyMesh = new THREE.Mesh(bodyGeo, matStoneSide);
         bodyMesh.position.set(cx, -0.43, cz);
         bodyMesh.receiveShadow = true;
         bodyMesh.castShadow = true;
-        levelGroup.add(bodyMesh);
+        platGroup.add(bodyMesh);
 
         const plinthGeo = track(new THREE.BoxGeometry(Math.max(0.2, w - 0.34), 0.44, Math.max(0.2, d - 0.34)));
         const plinthMesh = new THREE.Mesh(plinthGeo, matStoneDeep);
         plinthMesh.position.set(cx, -0.94, cz);
         plinthMesh.receiveShadow = true;
         plinthMesh.castShadow = true;
-        levelGroup.add(plinthMesh);
+        platGroup.add(plinthMesh);
+
+        // support cliff rooting the plinth down into the chasm (world y -2.36)
+        const cliffH = Math.max(0, platY) + 1.2;
+        const cliffGeo = track(new THREE.BoxGeometry(Math.max(0.2, w - 0.6), cliffH, Math.max(0.2, d - 0.6)));
+        const cliffMesh = new THREE.Mesh(cliffGeo, matStoneDeep);
+        cliffMesh.position.set(cx, -1.16 - cliffH * 0.5 + 0.0, cz);
+        cliffMesh.receiveShadow = true;
+        cliffMesh.castShadow = true;
+        platGroup.add(cliffMesh);
 
         if (w > 1.2 && d > 1.2) {
           const inset = 0.2;
@@ -595,12 +711,12 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
           ];
           const loopGeo = track(new THREE.BufferGeometry().setFromPoints(pts));
           const loop = new THREE.LineLoop(loopGeo, matInlayLine);
-          levelGroup.add(loop);
+          platGroup.add(loop);
 
           for (const p of pts) {
             const dia = new THREE.Mesh(cornerDiamondGeo, matBrass);
             dia.position.set(p.x, 0.005, p.z);
-            levelGroup.add(dia);
+            platGroup.add(dia);
           }
         }
 
@@ -622,7 +738,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
               tMesh.rotation.z = (edge === 'east' ? -1 : 1) * (0.04 + (i % 3) * 0.03);
               tMesh.receiveShadow = true;
               tMesh.castShadow = true;
-              levelGroup.add(tMesh);
+              platGroup.add(tMesh);
             } else {
               const span = Math.min(w * 0.78, 2.25);
               const tx = cx + frac * span;
@@ -633,10 +749,78 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
               tMesh.rotation.x = (edge === 'south' ? 1 : -1) * (0.04 + (i % 3) * 0.03);
               tMesh.receiveShadow = true;
               tMesh.castShadow = true;
-              levelGroup.add(tMesh);
+              platGroup.add(tMesh);
             }
           }
         }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Slope Walkways — terraced stair ramps the sphere rolls up and down
+    // -------------------------------------------------------------------------
+    const rampMat = track(
+      new THREE.MeshStandardMaterial({
+        color: palette.stoneTop,
+        roughness: 0.82,
+        metalness: 0.02,
+        flatShading: true,
+        side: THREE.DoubleSide,
+      })
+    );
+    const stepLineMat = track(
+      new THREE.LineBasicMaterial({ color: palette.stoneDeep, transparent: true, opacity: 0.6 })
+    );
+
+    for (const ramp of level.ramps ?? []) {
+      const f = { x: Math.sin(ramp.yaw), z: Math.cos(ramp.yaw) };
+      const r = { x: Math.cos(ramp.yaw), z: -Math.sin(ramp.yaw) };
+      const hl = ramp.length * 0.5;
+      const hw = ramp.width * 0.5;
+      const yBottom = -2.36;
+      const yLow = ramp.y;
+      const yHigh = ramp.y + ramp.rise;
+
+      const vert = (t: number, w: number, y: number) =>
+        new THREE.Vector3(ramp.x + f.x * t + r.x * w, y, ramp.z + f.z * t + r.z * w);
+      const A = (t: number, w: number, y: number) => vert(t, w, y);
+      const quad = (p1: THREE.Vector3, p2: THREE.Vector3, p3: THREE.Vector3, p4: THREE.Vector3) => {
+        rampPos.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z, p1.x, p1.y, p1.z, p3.x, p3.y, p3.z, p4.x, p4.y, p4.z);
+      };
+      const rampPos: number[] = [];
+      // top slope
+      quad(A(-hl, -hw, yLow), A(hl, -hw, yHigh), A(hl, hw, yHigh), A(-hl, hw, yLow));
+      // underside
+      quad(A(-hl, hw, yBottom), A(hl, hw, yBottom), A(hl, -hw, yBottom), A(-hl, -hw, yBottom));
+      // low vertical face
+      quad(A(-hl, -hw, yBottom), A(-hl, hw, yBottom), A(-hl, hw, yLow), A(-hl, -hw, yLow));
+      // high vertical face
+      quad(A(hl, -hw, yHigh), A(hl, hw, yHigh), A(hl, hw, yBottom), A(hl, -hw, yBottom));
+      // side walls (full cross-section)
+      quad(A(-hl, -hw, yBottom), A(-hl, -hw, yLow), A(hl, -hw, yHigh), A(hl, -hw, yBottom));
+      quad(A(-hl, hw, yBottom), A(hl, hw, yBottom), A(hl, hw, yHigh), A(-hl, hw, yLow));
+
+      const rampGeo = new THREE.BufferGeometry();
+      rampGeo.setAttribute('position', new THREE.Float32BufferAttribute(rampPos, 3));
+      rampGeo.computeVertexNormals();
+      track(rampGeo);
+      const rampMesh = new THREE.Mesh(rampGeo, rampMat);
+      rampMesh.castShadow = true;
+      rampMesh.receiveShadow = true;
+      levelGroup.add(rampMesh);
+
+      // stair nosing lines across the treads — sells the "terraced stairs" read
+      const stepCount = Math.max(2, Math.min(9, Math.round(Math.abs(ramp.rise) / 0.3)));
+      const stepPts: THREE.Vector3[] = [];
+      for (let s = 1; s < stepCount; s++) {
+        const t = -hl + (s / stepCount) * ramp.length;
+        const y = yLow + (s / stepCount) * ramp.rise + 0.006;
+        stepPts.push(vert(t, -hw, y), vert(t, hw, y));
+      }
+      if (stepPts.length > 0) {
+        const stepGeo = new THREE.BufferGeometry().setFromPoints(stepPts);
+        track(stepGeo);
+        levelGroup.add(new THREE.LineSegments(stepGeo, stepLineMat));
       }
     }
 
@@ -650,12 +834,13 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
     }> = [];
 
     for (const gap of level.brokenGaps) {
+      const gapY = gap.y ?? 0;
       const pts = [
-        new THREE.Vector3(gap.xMin + 0.06, 0.002, gap.zMin + 0.06),
-        new THREE.Vector3(gap.xMax - 0.06, 0.002, gap.zMin + 0.06),
-        new THREE.Vector3(gap.xMax - 0.06, 0.002, gap.zMax - 0.06),
-        new THREE.Vector3(gap.xMin + 0.06, 0.002, gap.zMax - 0.06),
-        new THREE.Vector3(gap.xMin + 0.06, 0.002, gap.zMin + 0.06),
+        new THREE.Vector3(gap.xMin + 0.06, gapY + 0.002, gap.zMin + 0.06),
+        new THREE.Vector3(gap.xMax - 0.06, gapY + 0.002, gap.zMin + 0.06),
+        new THREE.Vector3(gap.xMax - 0.06, gapY + 0.002, gap.zMax - 0.06),
+        new THREE.Vector3(gap.xMin + 0.06, gapY + 0.002, gap.zMax - 0.06),
+        new THREE.Vector3(gap.xMin + 0.06, gapY + 0.002, gap.zMin + 0.06),
       ];
       const lineGeo = track(new THREE.BufferGeometry().setFromPoints(pts));
       const lineMat = track(
@@ -684,7 +869,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         })
       );
       const glowMesh = new THREE.Mesh(glowGeo, glowMat);
-      glowMesh.position.set((gap.xMin + gap.xMax) * 0.5, -0.01, (gap.zMin + gap.zMax) * 0.5);
+      glowMesh.position.set((gap.xMin + gap.xMax) * 0.5, gapY - 0.01, (gap.zMin + gap.zMax) * 0.5);
       levelGroup.add(glowMesh);
 
       gapVisuals.push({ lineMat, glowMesh, glowMat });
@@ -826,16 +1011,18 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
       ringMat: THREE.MeshBasicMaterial;
       x: number;
       z: number;
+      y: number;
     }> = [];
 
     for (const crys of level.sunCrystals || []) {
+      const crysY = crys.y ?? 0;
       const pedBase = new THREE.Mesh(track(new THREE.CylinderGeometry(0.32, 0.38, 0.12, 8)), pillarMaterials.trim);
-      pedBase.position.set(crys.x, 0.06, crys.z);
+      pedBase.position.set(crys.x, crysY + 0.06, crys.z);
       pedBase.receiveShadow = true;
       levelGroup.add(pedBase);
 
       const pedCol = new THREE.Mesh(track(new THREE.CylinderGeometry(0.22, 0.28, 0.18, 8)), matBrass);
-      pedCol.position.set(crys.x, 0.2, crys.z);
+      pedCol.position.set(crys.x, crysY + 0.2, crys.z);
       pedCol.castShadow = true;
       levelGroup.add(pedCol);
 
@@ -858,12 +1045,12 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         })
       );
       const gem = new THREE.Mesh(gemGeo, gemMat);
-      gem.position.set(crys.x, 0.7, crys.z);
+      gem.position.set(crys.x, crysY + 0.7, crys.z);
       gem.castShadow = true;
       levelGroup.add(gem);
 
       const halo = new THREE.Mesh(track(new THREE.TorusGeometry(0.36, 0.018, 10, 32)), matBrass);
-      halo.position.set(crys.x, 0.7, crys.z);
+      halo.position.set(crys.x, crysY + 0.7, crys.z);
       levelGroup.add(halo);
 
       const auraGeo = track(new THREE.SphereGeometry(0.48, 18, 18));
@@ -876,7 +1063,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         })
       );
       const aura = new THREE.Mesh(auraGeo, auraMat);
-      aura.position.set(crys.x, 0.7, crys.z);
+      aura.position.set(crys.x, crysY + 0.7, crys.z);
       levelGroup.add(aura);
 
       const ringGeo = track(new THREE.RingGeometry(0.4, 0.45, 32));
@@ -890,10 +1077,10 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         })
       );
       const ring = new THREE.Mesh(ringGeo, ringMat);
-      ring.position.set(crys.x, 0.012, crys.z);
+      ring.position.set(crys.x, crysY + 0.012, crys.z);
       levelGroup.add(ring);
 
-      crystalVisuals.push({ gem, gemMat, halo, auraMat, ringMat, x: crys.x, z: crys.z });
+      crystalVisuals.push({ gem, gemMat, halo, auraMat, ringMat, x: crys.x, z: crys.z, y: crysY });
     }
 
     // -------------------------------------------------------------------------
@@ -910,7 +1097,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         })
       )
     );
-    startOuter.position.set(level.start.x, 0.011, level.start.z);
+    startOuter.position.set(level.start.x, (level.start.y ?? 0) + 0.011, level.start.z);
     levelGroup.add(startOuter);
 
     const startInner = new THREE.Mesh(
@@ -924,11 +1111,11 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         })
       )
     );
-    startInner.position.set(level.start.x, 0.011, level.start.z);
+    startInner.position.set(level.start.x, (level.start.y ?? 0) + 0.011, level.start.z);
     levelGroup.add(startInner);
 
     const goalGroup = new THREE.Group();
-    goalGroup.position.set(level.goal.x, 0, level.goal.z);
+    goalGroup.position.set(level.goal.x, level.goal.y ?? 0, level.goal.z);
     levelGroup.add(goalGroup);
 
     const goalFloorMat = track(
@@ -1385,7 +1572,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
     let trailCursor = 0;
     let trailSpawnAccum = 0;
 
-    const spawnTrailPuff = (x: number, z: number, onShadow: boolean) => {
+    const spawnTrailPuff = (x: number, z: number, onShadow: boolean, y = 0.06) => {
       const item = trailItems[trailCursor];
       trailCursor = (trailCursor + 1) % trailMax;
       item.life = 0.001;
@@ -1394,7 +1581,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
       item.mat.color.set(onShadow ? palette.accentPale : palette.stoneSide);
       item.mesh.position.set(
         x + (Math.random() - 0.5) * 0.14,
-        0.06,
+        y,
         z + (Math.random() - 0.5) * 0.14
       );
       item.mesh.scale.setScalar(onShadow ? 1.15 : 0.85);
@@ -1413,9 +1600,11 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
       bridgePending = false;
       lastBridgeEval = performance.now();
       const prevBridged = sim.bridgedFlags;
-      const nextBridged = level.brokenGaps.map((gap) =>
-        isGapBridged(gap, level.platforms, sim.shadows, groundBlockers)
-      );
+      const nextBridged = level.brokenGaps.map((gap) => {
+        const gy = gap.y ?? 0;
+        const planePlatforms = level.platforms.filter((p) => Math.abs((p.y ?? 0) - gy) <= 0.02);
+        return isGapBridged(gap, planePlatforms, sim.shadowsByPlane.get(gy) ?? [], groundBlockers);
+      });
       sim.bridgedFlags = nextBridged;
 
       if (playCues && nextBridged.some((val, idx) => val && !prevBridged[idx])) {
@@ -1440,20 +1629,31 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
     const rebuildShadows = (playCues: boolean, evalBridges = true) => {
       clearDynamicUmbra();
 
-      const polys: Vec2[][] = [];
-      for (const structure of level.pillars) {
-        for (const box of structure.parts) {
-          const poly = projectBoxShadowToGround(box, sim.lightPos, shadowRatio);
-          if (poly.length >= 3) polys.push(poly);
-        }
-      }
-      sim.shadows = polys;
+      const planeYs = new Set<number>([0]);
+      for (const p of level.platforms) if (p.y) planeYs.add(p.y);
+      for (const g of level.brokenGaps) if (g.y) planeYs.add(g.y);
+      for (const c of level.sunCrystals ?? []) if (c.y) planeYs.add(c.y);
 
-      const silhouette = traceUmbraSilhouette(polys);
-      const drawn = silhouette.length > 0 ? silhouette : polys;
+      const shadowsByPlane = new Map<number, Vec2[][]>();
+      for (const h of planeYs) {
+        const planePolys: Vec2[][] = [];
+        for (const structure of level.pillars) {
+          for (const box of structure.parts) {
+            const poly = projectBoxShadowToPlane(box, sim.lightPos, shadowRatio, h);
+            if (poly.length >= 3) planePolys.push(poly);
+          }
+        }
+        shadowsByPlane.set(h, planePolys);
+      }
+      sim.shadowsByPlane = shadowsByPlane;
+      sim.shadows = shadowsByPlane.get(0) ?? [];
+
       const ribPositions: number[] = [];
       const ribIndices: number[] = [];
-      for (const loop of drawn) {
+      for (const [planeY, polys] of shadowsByPlane) {
+        const silhouette = traceUmbraSilhouette(polys);
+        const drawn = silhouette.length > 0 ? silhouette : polys;
+        for (const loop of drawn) {
         const shape = new THREE.Shape();
         shape.moveTo(loop[0].x, -loop[0].z);
         for (let i = 1; i < loop.length; i++) shape.lineTo(loop[i].x, -loop[i].z);
@@ -1463,7 +1663,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         extGeo.rotateX(-Math.PI / 2);
         dynamicUmbraGeos.push(extGeo);
         const slab = new THREE.Mesh(extGeo, umbraSlabMat);
-        slab.position.y = -0.04;
+        slab.position.y = planeY - 0.04;
         slab.receiveShadow = false;
         umbraGroup.add(slab);
 
@@ -1504,9 +1704,10 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
           const o = i * 2;
           const p = ((i + 1) % n) * 2;
           const base = ribPositions.length / 3;
-          ribPositions.push(ring[o][0], 0.012, ring[o][1], ring[o + 1][0], 0.012, ring[o + 1][1]);
-          ribPositions.push(ring[p][0], 0.012, ring[p][1], ring[p + 1][0], 0.012, ring[p + 1][1]);
+          ribPositions.push(ring[o][0], planeY + 0.012, ring[o][1], ring[o + 1][0], planeY + 0.012, ring[o + 1][1]);
+          ribPositions.push(ring[p][0], planeY + 0.012, ring[p][1], ring[p + 1][0], planeY + 0.012, ring[p + 1][1]);
           ribIndices.push(base, base + 1, base + 2, base + 1, base + 3, base + 2);
+        }
         }
       }
 
@@ -1521,7 +1722,9 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
       }
 
       const prevEclipsed = sim.eclipsed;
-      const nextEclipsed = (level.sunCrystals || []).some((c) => isCrystalEclipsed(c, polys));
+      const nextEclipsed = (level.sunCrystals || []).some((c) =>
+        isCrystalEclipsed(c, shadowsByPlane.get(c.y ?? 0) ?? [])
+      );
       sim.eclipsed = nextEclipsed;
       if (playCues && (level.sunCrystals?.length || 0) > 0 && prevEclipsed !== nextEclipsed) {
         sound.playEclipseState(nextEclipsed);
@@ -2074,7 +2277,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
 
       for (const cv of crystalVisuals) {
         cv.gem.rotation.y += dt * (sim.eclipsed ? 0.35 : 1.7);
-        cv.gem.position.y = 0.7 + Math.sin(tSec * 2.6) * 0.05;
+        cv.gem.position.y = cv.y + 0.7 + Math.sin(tSec * 2.6) * 0.05;
         cv.halo.rotation.x = Math.PI / 2 + Math.sin(tSec * 1.4) * 0.4;
         cv.halo.rotation.y += dt * (sim.eclipsed ? 0.3 : 1.3);
         cv.gemMat.color.set(sim.eclipsed ? palette.neutral : palette.accentPale);
@@ -2122,20 +2325,32 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
       // -----------------------------------------------------------------------
       // Physical Sphere & Shadow Interaction
       // -----------------------------------------------------------------------
-      let supportState = checkPointSupport(
+      const supportOf = (ev: SupportEvaluation) => ({
+        supported: !!ev.best,
+        onPlatform: ev.best?.source === 'platform',
+        onShadow: ev.best?.onShadow ?? false,
+        minDist: ev.best?.dist ?? Infinity,
+        height: ev.best?.height ?? 0,
+      });
+      let supportEval = evaluateSupport(
         sim.ballPos.x,
         sim.ballPos.z,
+        sim.ballPos.y - BALL_RADIUS,
         level.platforms,
-        sim.shadows,
-        0.13
+        level.brokenGaps,
+        level.ramps,
+        sim.bridgedFlags,
+        sim.shadowsByPlane,
+        0.14
       );
+      let supportState = supportOf(supportEval);
 
       if (sim.won) {
         sim.winTimer += dt;
         const k = Math.min(1, sim.winTimer / 0.65);
         sim.ballPos.x += (level.goal.x - sim.ballPos.x) * 0.16;
         sim.ballPos.z += (level.goal.z - sim.ballPos.z) * 0.16;
-        sim.ballPos.y = BALL_RADIUS + Math.sin(k * Math.PI) * 0.6 + k * 0.28;
+        sim.ballPos.y = (level.goal.y ?? 0) + BALL_RADIUS + Math.sin(k * Math.PI) * 0.6 + k * 0.28;
         const shrink = Math.max(0.01, 1 - k * 0.85);
         ballRoot.scale.setScalar(shrink);
         ballVisual.rotation.y += dt * 10;
@@ -2159,6 +2374,26 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
           ballVisual.quaternion.copy(sim.ballQuat);
         }
 
+        // Land on any terrace / bridge / ramp below the falling sphere (drop-down is allowed)
+        const landEval = evaluateSupport(
+          sim.ballPos.x,
+          sim.ballPos.z,
+          sim.ballPos.y - BALL_RADIUS,
+          level.platforms,
+          level.brokenGaps,
+          level.ramps,
+          sim.bridgedFlags,
+          sim.shadowsByPlane,
+          0.14
+        );
+        if (landEval.best && sim.ballVy <= 0) {
+          sim.ballPos.y = landEval.best.height + BALL_RADIUS;
+          sim.falling = false;
+          sim.fallTimer = 0;
+          sim.splashed = false;
+          sim.ballVy = 0;
+        }
+
         // Trigger physical water splash & sound when crossing the water plane
         if (!sim.splashed && sim.ballPos.y <= GROUND_Y + 0.34) {
           sim.splashed = true;
@@ -2176,7 +2411,7 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
           sim.falling = false;
           sim.fallTimer = 0;
           sim.splashed = false;
-          sim.ballPos.set(sim.lastSafePos.x, BALL_RADIUS + 0.45, sim.lastSafePos.z);
+          sim.ballPos.set(sim.lastSafePos.x, (sim.lastSafePos.y ?? 0) + BALL_RADIUS + 0.45, sim.lastSafePos.z);
           sim.ballVel = { x: 0, z: 0 };
           sim.ballVy = 0;
           ballRoot.scale.setScalar(1);
@@ -2185,12 +2420,17 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
       } else {
         ballRoot.scale.setScalar(1);
 
-        // Physical vertical settle with subtle damped stone micro-bounce
-        if (sim.ballPos.y > BALL_RADIUS || Math.abs(sim.ballVy) > 0.01) {
+        // Physical vertical settle — ramps are glued to the grade; flat stones micro-bounce
+        const standTarget = (supportState.supported ? supportState.height : 0) + BALL_RADIUS;
+        const onRamp = supportEval.best?.source === 'ramp';
+        if (onRamp) {
+          sim.ballPos.y += (standTarget - sim.ballPos.y) * Math.min(1, dt * 13);
+          sim.ballVy = 0;
+        } else if (sim.ballPos.y > standTarget || Math.abs(sim.ballVy) > 0.01) {
           sim.ballVy -= 18.0 * dt;
           sim.ballPos.y += sim.ballVy * dt;
-          if (sim.ballPos.y <= BALL_RADIUS) {
-            sim.ballPos.y = BALL_RADIUS;
+          if (sim.ballPos.y <= standTarget) {
+            sim.ballPos.y = standTarget;
             if (sim.ballVy < -0.75) {
               sim.ballVy = -sim.ballVy * 0.24;
             } else {
@@ -2226,6 +2466,13 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
           sim.ballVel.z += az * dt;
         }
 
+        // Gravity gently pulls the sphere downhill on walkway slopes
+        if (onRamp && supportEval.best?.rampYaw !== undefined) {
+          const pull = 3.1 * (supportEval.best.rampSlope ?? 0);
+          sim.ballVel.x += -Math.sin(supportEval.best.rampYaw) * pull * dt;
+          sim.ballVel.z += -Math.cos(supportEval.best.rampYaw) * pull * dt;
+        }
+
         // Slightly smoother glass-like glide on solidified shadow vs. mossy stone traction
         const dragRate = supportState.onShadow ? 5.6 : 6.2;
         const damping = Math.exp(-dragRate * dt);
@@ -2258,12 +2505,50 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
           }
         }
 
+        // Cliff faces of raised stones are walls; so is any ramp body above the sphere's feet
+        const feetY = sim.ballPos.y - BALL_RADIUS;
+        for (const plat of level.platforms) {
+          const py = plat.y ?? 0;
+          if (py <= feetY + 0.02) continue;
+          const col = resolveCircleRectCollision(nextX, nextZ, nextVx, nextVz, BALL_RADIUS, plat);
+          if (col.hit) {
+            nextX = col.x;
+            nextZ = col.z;
+            nextVx = col.vx;
+            nextVz = col.vz;
+            hitSomething = true;
+          }
+        }
+        for (const ramp of level.ramps ?? []) {
+          const hHere = rampHeightAt(ramp, nextX, nextZ, BALL_RADIUS);
+          if (hHere === null || hHere <= feetY + 0.02) continue;
+          const col = resolveCircleRotRectCollision(
+            nextX,
+            nextZ,
+            nextVx,
+            nextVz,
+            BALL_RADIUS,
+            { x: ramp.x, z: ramp.z },
+            ramp.length * 0.5,
+            ramp.width * 0.5,
+            ramp.yaw
+          );
+          if (col.hit) {
+            nextX = col.x;
+            nextZ = col.z;
+            nextVx = col.vx;
+            nextVz = col.vz;
+            hitSomething = true;
+          }
+        }
+
         if (sim.eclipsed) {
           const gdx = nextX - level.goal.x;
           const gdz = nextZ - level.goal.z;
           const gDist = Math.hypot(gdx, gdz);
           const lockRad = 0.66 + BALL_RADIUS;
-          if (gDist < lockRad && gDist > 1e-5) {
+          const heightOK = Math.abs(sim.ballPos.y - BALL_RADIUS - (level.goal.y ?? 0)) < 1.2;
+          if (heightOK && gDist < lockRad && gDist > 1e-5) {
             const nx = gdx / gDist;
             const nz = gdz / gDist;
             nextX = level.goal.x + nx * lockRad;
@@ -2297,13 +2582,18 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
           ballVisual.quaternion.copy(sim.ballQuat);
         }
 
-        supportState = checkPointSupport(
+        supportEval = evaluateSupport(
           sim.ballPos.x,
           sim.ballPos.z,
+          sim.ballPos.y - BALL_RADIUS,
           level.platforms,
-          sim.shadows,
+          level.brokenGaps,
+          level.ramps,
+          sim.bridgedFlags,
+          sim.shadowsByPlane,
           0.14
         );
+        supportState = supportOf(supportEval);
 
         if (!supportState.supported) {
           sim.falling = true;
@@ -2314,34 +2604,34 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
           sound.updateRolling(0, false, true);
         } else {
           // Subtle physical ledge dip when balanced right on the outer bevel of a stone/shadow edge
-          if (supportState.minDist > 0.04 && sim.ballPos.y <= BALL_RADIUS + 0.01) {
+          if (supportState.minDist > 0.04 && sim.ballPos.y <= supportState.height + BALL_RADIUS + 0.01) {
             const lipFrac = (supportState.minDist - 0.04) / 0.1;
             sim.ballPos.y = BALL_RADIUS - lipFrac * lipFrac * 0.045;
           }
 
-          const liftFade = Math.max(0.25, 1 - (sim.ballPos.y - BALL_RADIUS) * 1.4);
+          const liftFade = Math.max(0.25, 1 - (sim.ballPos.y - supportState.height - BALL_RADIUS) * 1.4);
           ballContactRing.visible = true;
-          ballContactRing.position.set(sim.ballPos.x, 0.013, sim.ballPos.z);
+          ballContactRing.position.set(sim.ballPos.x, supportState.height + 0.013, sim.ballPos.z);
           ballShadowRingMat.opacity = 0.56 * liftFade;
 
           // Project the sphere's directional sun shadow along the exact parallel sun ray!
           ballSunShadow.visible = true;
-          const centerH = Math.max(BALL_RADIUS, sim.ballPos.y);
+          const centerH = Math.max(BALL_RADIUS, sim.ballPos.y - supportState.height);
           const projX = sim.ballPos.x + nextShadowOff.x * (centerH * 0.65);
           const projZ = sim.ballPos.z + nextShadowOff.z * (centerH * 0.65);
-          ballSunShadow.position.set(projX, 0.011, projZ);
+          ballSunShadow.position.set(projX, supportState.height + 0.011, projZ);
           ballSunShadow.rotation.y = Math.atan2(nextShadowOff.x, nextShadowOff.z);
           ballSunShadowMat.opacity = (supportState.onShadow ? 0.42 : 0.22) * liftFade;
 
           const speedNorm = Math.min(1, speed / maxSpeed);
-          sound.updateRolling(speedNorm, supportState.onShadow, sim.ballPos.y > BALL_RADIUS + 0.05);
+          sound.updateRolling(speedNorm, supportState.onShadow, sim.ballPos.y > supportState.height + BALL_RADIUS + 0.05);
 
           if (moved > 0.008) {
             trailSpawnAccum += moved;
             const spacing = supportState.onShadow ? 0.14 : 0.24;
             if (trailSpawnAccum >= spacing) {
               trailSpawnAccum = 0;
-              spawnTrailPuff(sim.ballPos.x, sim.ballPos.z, supportState.onShadow);
+              spawnTrailPuff(sim.ballPos.x, sim.ballPos.z, supportState.onShadow, supportState.height + 0.06);
             }
           }
 
@@ -2354,14 +2644,15 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
               sim.ballPos.z >= plat.zMin + margin &&
               sim.ballPos.z <= plat.zMax - margin
             ) {
-              sim.lastSafePos = { x: sim.ballPos.x, z: sim.ballPos.z };
+              sim.lastSafePos = { x: sim.ballPos.x, z: sim.ballPos.z, y: supportState.height };
               break;
             }
           }
 
           if (!sim.eclipsed) {
             const goalDist = Math.hypot(sim.ballPos.x - level.goal.x, sim.ballPos.z - level.goal.z);
-            if (goalDist <= 0.52) {
+            const goalTerrace = Math.abs(sim.ballPos.y - BALL_RADIUS - (level.goal.y ?? 0)) < 0.8;
+            if (goalDist <= 0.52 && goalTerrace) {
               sim.won = true;
               sim.winTimer = 0;
               sound.playVictory();
