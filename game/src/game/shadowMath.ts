@@ -127,6 +127,47 @@ export function sunShadowOffsetPerHeight(light: Vec3, ratio = DEFAULT_SHADOW_RAT
 }
 
 /**
+ * Projects a 3D axis-aligned box onto an arbitrary horizontal plane (y = planeY) using
+ * parallel (directional) sunlight. Directly grounded stones live on planeY = 0; raised
+ * terraces and spans collect their own, shorter shadow pools on their own planes.
+ * Parts of the box below the receiving plane cast nothing onto it.
+ */
+export function projectBoxShadowToPlane(
+  box: Box3D,
+  light: Vec3,
+  ratio = DEFAULT_SHADOW_RATIO,
+  planeY = 0
+): Vec2[] {
+  if (box.castsUmbra === false) return [];
+  const off = sunShadowOffsetPerHeight(light, ratio);
+
+  if (box.yMax <= planeY) return [];
+
+  // Sweep the footprint from the receiving plane up through the box's top edge.
+  const offsets = new Set<number>([0]);
+  if (box.yMin > planeY) offsets.add(box.yMin - planeY);
+  offsets.add(box.yMax - planeY);
+
+  // Footprint corners, honouring an optional yaw about the box centre.
+  const cx = (box.xMin + box.xMax) * 0.5;
+  const cz = (box.zMin + box.zMax) * 0.5;
+  let footprint = rectCorners(box);
+  if (box.yaw) footprint = rotateAround(footprint, { x: cx, z: cz }, box.yaw);
+
+  const projected: Vec2[] = [];
+  for (const h of offsets) {
+    for (const v of footprint) {
+      projected.push({
+        x: v.x + off.x * h,
+        z: v.z + off.z * h,
+      });
+    }
+  }
+
+  return convexHull2D(projected);
+}
+
+/**
  * Projects a 3D axis-aligned box onto the y = 0 ground plane using parallel (directional) sunlight.
  * Because rays are parallel, the shadow keeps the exact footprint width of the pillar and a
  * constant length for a given sun elevation — it is simply swept along the sun direction.
@@ -136,28 +177,7 @@ export function projectBoxShadowToGround(
   light: Vec3,
   ratio = DEFAULT_SHADOW_RATIO
 ): Vec2[] {
-  if (box.castsUmbra === false) return [];
-  const off = sunShadowOffsetPerHeight(light, ratio);
-
-  const ys = [Math.max(0, box.yMin), box.yMax];
-
-  // Footprint corners, honouring an optional yaw about the box centre.
-  const cx = (box.xMin + box.xMax) * 0.5;
-  const cz = (box.zMin + box.zMax) * 0.5;
-  let footprint = rectCorners(box);
-  if (box.yaw) footprint = rotateAround(footprint, { x: cx, z: cz }, box.yaw);
-
-  const projected: Vec2[] = [];
-  for (const vy of ys) {
-    for (const v of footprint) {
-      projected.push({
-        x: v.x + off.x * vy,
-        z: v.z + off.z * vy,
-      });
-    }
-  }
-
-  return convexHull2D(projected);
+  return projectBoxShadowToPlane(box, light, ratio, 0);
 }
 
 function distPointToSegment(p: Vec2, a: Vec2, b: Vec2): number {
@@ -624,4 +644,140 @@ export function isCrystalEclipsed(crystal: SunCrystal, shadows: Vec2[][]): boole
     }
   }
   return false;
+}
+
+/* ---------------------------------------------------------- ramps & elevation */
+
+/** Anything with a sloped top the sphere can roll on. Matches RampDef in types.ts. */
+export interface RampLike {
+  x: number;
+  z: number;
+  yaw: number;
+  length: number;
+  width: number;
+  y: number;
+  rise: number;
+}
+
+const rampForward = (yaw: number): Vec2 => ({ x: Math.sin(yaw), z: Math.cos(yaw) });
+const rampRight = (yaw: number): Vec2 => ({ x: Math.cos(yaw), z: -Math.sin(yaw) });
+
+/**
+ * Local-frame coordinates of a point on a ramp: `t` along the ascend axis (0 at the low
+ * edge, `length` at the high edge) and `u` across it (0 at the centre).
+ */
+export function rampLocalFrame(
+  ramp: RampLike,
+  x: number,
+  z: number
+): { t: number; u: number; fx: number; fz: number; rx: number; rz: number } {
+  const f = rampForward(ramp.yaw);
+  const r = rampRight(ramp.yaw);
+  const dx = x - ramp.x;
+  const dz = z - ramp.z;
+  return {
+    t: dx * f.x + dz * f.z + ramp.length * 0.5,
+    u: dx * r.x + dz * r.z,
+    fx: f.x,
+    fz: f.z,
+    rx: r.x,
+    rz: r.z,
+  };
+}
+
+/**
+ * Height of the ramp surface at world (x, z), or null when the point lies outside the
+ * footprint. `forgiveness` extends the footprint outward (used for sphere edge tolerance).
+ */
+export function rampHeightAt(ramp: RampLike, x: number, z: number, forgiveness = 0): number | null {
+  const { t, u } = rampLocalFrame(ramp, x, z);
+  const hw = ramp.width * 0.5;
+  if (u < -hw - forgiveness || u > hw + forgiveness) return null;
+  if (t < -forgiveness || t > ramp.length + forgiveness) return null;
+  const k = ramp.length > 1e-6 ? Math.max(0, Math.min(1, t / ramp.length)) : 0;
+  return ramp.y + k * ramp.rise;
+}
+
+/**
+ * Distance from a point to the nearest edge of the ramp footprint (0 inside). Used for
+ * ledge-dip polish and sphere forgiveness, mirroring distanceToRect for flat stones.
+ */
+export function distanceToRamp(ramp: RampLike, p: Vec2): number {
+  const { t, u } = rampLocalFrame(ramp, p.x, p.z);
+  const hw = ramp.width * 0.5;
+  const dt = Math.max(0, -t, t - ramp.length);
+  const du = Math.max(0, Math.abs(u) - hw);
+  return Math.hypot(dt, du);
+}
+
+/**
+ * Resolves circle-vs-rotated-rectangle collision in the XZ plane (oriented bounding box).
+ * Ramps are rotated prisms, so the axis-aligned resolver is not enough to stop the sphere
+ * from clipping through an elevated ramp body.
+ */
+export function resolveCircleRotRectCollision(
+  bx: number,
+  bz: number,
+  vx: number,
+  vz: number,
+  radius: number,
+  center: Vec2,
+  halfLength: number,
+  halfWidth: number,
+  yaw: number
+): { x: number; z: number; vx: number; vz: number; hit: boolean } {
+  const f = rampForward(yaw);
+  const r = rampRight(yaw);
+  const dx = bx - center.x;
+  const dz = bz - center.z;
+  // Local frame: l along the length axis, w along the width axis.
+  let l = dx * f.x + dz * f.z;
+  let w = dx * r.x + dz * r.z;
+
+  const closestL = Math.max(-halfLength, Math.min(l, halfLength));
+  const closestW = Math.max(-halfWidth, Math.min(w, halfWidth));
+
+  let dl = l - closestL;
+  let dw = w - closestW;
+  const distSq = dl * dl + dw * dw;
+
+  if (distSq >= radius * radius) {
+    return { x: bx, z: bz, vx, vz, hit: false };
+  }
+
+  let nl = 0;
+  let nw = 0;
+  let penetration = 0;
+  if (distSq > 1e-8) {
+    const dist = Math.sqrt(distSq);
+    nl = dl / dist;
+    nw = dw / dist;
+    penetration = radius - dist;
+  } else {
+    const penL = halfLength - Math.abs(l);
+    const penW = halfWidth - Math.abs(w);
+    if (penL < penW) {
+      nl = l >= 0 ? 1 : -1;
+      penetration = penL + radius;
+    } else {
+      nw = w >= 0 ? 1 : -1;
+      penetration = penW + radius;
+    }
+  }
+
+  // Back to world space
+  const nx = nl * f.x + nw * r.x;
+  const nz = nl * f.z + nw * r.z;
+  const outX = bx + nx * penetration;
+  const outZ = bz + nz * penetration;
+
+  const vn = vx * nx + vz * nz;
+  let outVx = vx;
+  let outVz = vz;
+  if (vn < 0) {
+    outVx -= 1.2 * vn * nx;
+    outVz -= 1.2 * vn * nz;
+  }
+
+  return { x: outX, z: outZ, vx: outVx, vz: outVz, hit: true };
 }

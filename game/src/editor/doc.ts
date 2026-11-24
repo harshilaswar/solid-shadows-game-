@@ -3,7 +3,8 @@ import type { LevelData, Vec2, Vec3 } from '../game/types';
 import {
   isCrystalEclipsed,
   isGapBridged,
-  projectBoxShadowToGround,
+  projectBoxShadowToPlane,
+  rampHeightAt,
   sunShadowOffsetPerHeight,
 } from '../game/shadowMath';
 
@@ -25,6 +26,8 @@ export interface PlatformItem {
   points?: Vec2[];
   /** Yaw in radians about the object centre. Preserved across edits/rotation. */
   yaw?: number;
+  /** Elevation of the stone's top surface in world units (default 0). */
+  y?: number;
 }
 
 export interface BoxItem {
@@ -60,6 +63,8 @@ export interface GapItem {
   bz: number;
   /** Yaw in radians about the span centre. */
   yaw?: number;
+  /** Elevation of the bridging slab plane (default 0). Shadow bridges this span on its own plane. */
+  y?: number;
 }
 
 export interface CrystalItem {
@@ -67,6 +72,26 @@ export interface CrystalItem {
   x: number;
   z: number;
   radius: number;
+  /** Elevation of the crystal pedestal (default 0). */
+  y?: number;
+}
+
+export interface RampItem {
+  id: string;
+  name: string;
+  /** Centre of the footprint. */
+  x: number;
+  z: number;
+  /** Yaw in radians; the ramp ascends along its local +Z axis. */
+  yaw: number;
+  /** Horizontal length along the ascend axis. */
+  length: number;
+  /** Horizontal width across the ascend axis. */
+  width: number;
+  /** Elevation of the low edge (world y). */
+  y: number;
+  /** Height gained from the low edge to the high edge. */
+  rise: number;
 }
 
 export interface Doc {
@@ -82,6 +107,8 @@ export interface Doc {
   pillars: PillarItem[];
   gaps: GapItem[];
   crystals: CrystalItem[];
+  /** Slope walkways the sphere can roll up and down between terraces. */
+  ramps?: RampItem[];
   start: Vec2;
   goal: Vec2;
   sun: { maxRadius: number; y: number; shadowRatio: number; azimuth: number };
@@ -201,6 +228,7 @@ export function docFromLevel(src: LevelData): Doc {
       style: p.style ?? 'main',
       brokenEdges: p.brokenEdges ?? [],
       points: p.points ? p.points.map((v) => ({ x: v.x, z: v.z })) : undefined,
+      y: p.y,
     })),
     pillars: src.pillars.map((s) => ({
       id: s.id || uid('pil'),
@@ -229,12 +257,25 @@ export function docFromLevel(src: LevelData): Doc {
       az: g.anchorA.z,
       bx: g.anchorB.x,
       bz: g.anchorB.z,
+      y: g.y,
     })),
     crystals: (src.sunCrystals ?? []).map((c) => ({
       id: c.id || uid('c'),
       x: c.x,
       z: c.z,
       radius: c.radius,
+      y: c.y,
+    })),
+    ramps: (src.ramps ?? []).map((r) => ({
+      id: r.id || uid('r'),
+      name: r.id || 'Ramp',
+      x: r.x,
+      z: r.z,
+      yaw: r.yaw,
+      length: r.length,
+      width: r.width,
+      y: r.y,
+      rise: r.rise,
     })),
     start: { ...src.start },
     goal: { ...src.goal },
@@ -275,6 +316,7 @@ export function toLevelData(doc: Doc): LevelData {
       points: p.points && p.points.length >= 3
         ? p.points.map((v) => ({ x: round(v.x), z: round(v.z) }))
         : undefined,
+      y: p.y,
     })),
     pillars: doc.pillars.map((s) => ({
       id: s.id,
@@ -299,12 +341,25 @@ export function toLevelData(doc: Doc): LevelData {
       zMax: round(g.zMax),
       anchorA: { x: round(g.ax), z: round(g.az) },
       anchorB: { x: round(g.bx), z: round(g.bz) },
+      y: g.y,
     })),
-    sunCrystals: doc.crystals.length
-      ? doc.crystals.map((c) => ({ id: c.id, x: round(c.x), z: round(c.z), radius: c.radius }))
+    ramps: doc.ramps && doc.ramps.length
+      ? doc.ramps.map((r) => ({
+          id: r.id,
+          x: round(r.x),
+          z: round(r.z),
+          yaw: round(r.yaw),
+          length: round(r.length),
+          width: round(r.width),
+          y: round(r.y),
+          rise: round(r.rise),
+        }))
       : undefined,
-    start: { x: round(doc.start.x), z: round(doc.start.z) },
-    goal: { x: round(doc.goal.x), z: round(doc.goal.z) },
+    sunCrystals: doc.crystals.length
+      ? doc.crystals.map((c) => ({ id: c.id, x: round(c.x), z: round(c.z), radius: c.radius, y: c.y }))
+      : undefined,
+    start: { x: round(doc.start.x), z: round(doc.start.z), y: doc.start.y === undefined ? undefined : round(doc.start.y) },
+    goal: { x: round(doc.goal.x), z: round(doc.goal.z), y: doc.goal.y === undefined ? undefined : round(doc.goal.y) },
     lightInitial: { x: round(sp.x), y: doc.sun.y, z: round(sp.z) },
     lightBounds: {
       maxRadius: doc.sun.maxRadius,
@@ -426,6 +481,10 @@ export function selectionCenter(doc: Doc, kind: string, id: string): Vec2 | null
     const c = doc.crystals.find((v) => v.id === id);
     return c ? { x: c.x, z: c.z } : null;
   }
+  if (kind === 'ramp') {
+    const r = (doc.ramps ?? []).find((v) => v.id === id);
+    return r ? { x: r.x, z: r.z } : null;
+  }
   if (kind === 'part' || kind === 'pillar') {
     for (const st of doc.pillars) {
       const boxes = kind === 'pillar' ? st.parts : st.parts.filter((b) => b.id === id);
@@ -491,6 +550,13 @@ export function rotateDocObject(base: Doc, kind: string, id: string, angle: numb
         const b = rot({ x: g.bx, z: g.bz });
         return { ...g, xMin: bb.xMin, xMax: bb.xMax, zMin: bb.zMin, zMax: bb.zMax, ax: a.x, az: a.z, bx: b.x, bz: b.z, yaw: (g.yaw ?? 0) + angle };
       }),
+    };
+  }
+
+  if (kind === 'ramp') {
+    return {
+      ...base,
+      ramps: (base.ramps ?? []).map((r) => (r.id === id ? { ...r, yaw: r.yaw + angle } : r)),
     };
   }
 
@@ -584,6 +650,12 @@ export function moveDocObject(base: Doc, kind: string, id: string, dx: number, d
       crystals: base.crystals.map((c) => (c.id === id ? { ...c, x: c.x + dx, z: c.z + dz } : c)),
     };
   }
+  if (kind === 'ramp') {
+    return {
+      ...base,
+      ramps: (base.ramps ?? []).map((r) => (r.id === id ? { ...r, x: r.x + dx, z: r.z + dz } : r)),
+    };
+  }
   if (kind === 'start' || kind === 'goal') {
     return { ...base, [kind]: { x: base[kind].x + dx, z: base[kind].z + dz } } as Doc;
   }
@@ -655,10 +727,10 @@ export function transformOf(doc: Doc, kind: string, id: string): ObjectTransform
       id,
       name: p.name,
       kindLabel: 'Stone',
-      position: { x: (r.xMin + r.xMax) / 2, y: 0, z: (r.zMin + r.zMax) / 2 },
+      position: { x: (r.xMin + r.xMax) / 2, y: p.y ?? 0, z: (r.zMin + r.zMax) / 2 },
       rotationDeg: deg(p.yaw ?? 0),
       size: { x: r.xMax - r.xMin, y: null, z: r.zMax - r.zMin },
-      canMoveY: false,
+      canMoveY: true,
       canRotate: true,
       canScaleX: true,
       canScaleY: false,
@@ -674,10 +746,10 @@ export function transformOf(doc: Doc, kind: string, id: string): ObjectTransform
       id,
       name: g.name,
       kindLabel: 'Broken span',
-      position: { x: (r.xMin + r.xMax) / 2, y: 0, z: (r.zMin + r.zMax) / 2 },
+      position: { x: (r.xMin + r.xMax) / 2, y: g.y ?? 0, z: (r.zMin + r.zMax) / 2 },
       rotationDeg: deg(g.yaw ?? 0),
       size: { x: r.xMax - r.xMin, y: null, z: r.zMax - r.zMin },
-      canMoveY: false,
+      canMoveY: true,
       canRotate: true,
       canScaleX: true,
       canScaleY: false,
@@ -715,10 +787,10 @@ export function transformOf(doc: Doc, kind: string, id: string): ObjectTransform
       id,
       name: 'Sun crystal',
       kindLabel: 'Crystal',
-      position: { x: c.x, y: 0, z: c.z },
+      position: { x: c.x, y: c.y ?? 0, z: c.z },
       rotationDeg: null,
       size: { x: c.radius * 2, y: c.radius * 2, z: c.radius * 2 },
-      canMoveY: false,
+      canMoveY: true,
       canRotate: false,
       canScaleX: true,
       canScaleY: false,
@@ -732,14 +804,32 @@ export function transformOf(doc: Doc, kind: string, id: string): ObjectTransform
       id: kind,
       name: kind === 'start' ? 'Sphere start' : 'Sanctuary goal',
       kindLabel: kind === 'start' ? 'Start' : 'Goal',
-      position: { x: p.x, y: 0, z: p.z },
+      position: { x: p.x, y: p.y ?? 0, z: p.z },
       rotationDeg: null,
       size: { x: null, y: null, z: null },
-      canMoveY: false,
+      canMoveY: true,
       canRotate: false,
       canScaleX: false,
       canScaleY: false,
       canScaleZ: false,
+    };
+  }
+  if (kind === 'ramp') {
+    const r = (doc.ramps ?? []).find((v) => v.id === id);
+    if (!r) return null;
+    return {
+      kind: 'ramp',
+      id,
+      name: r.name,
+      kindLabel: 'Walkway ramp',
+      position: { x: r.x, y: r.y, z: r.z },
+      rotationDeg: deg(r.yaw),
+      size: { x: r.length, y: r.rise, z: r.width },
+      canMoveY: true,
+      canRotate: true,
+      canScaleX: true,
+      canScaleY: true,
+      canScaleZ: true,
     };
   }
   if (kind === 'sun') {
@@ -777,6 +867,16 @@ export function setObjectPosition(base: Doc, kind: string, id: string, pos: Part
         };
       } else if (kind === 'sun') {
         next = { ...next, sun: { ...next.sun, y: pos.y } };
+      } else if (kind === 'platform') {
+        next = { ...next, platforms: next.platforms.map((p) => (p.id === id ? { ...p, y: pos.y } : p)) };
+      } else if (kind === 'gap') {
+        next = { ...next, gaps: next.gaps.map((g) => (g.id === id ? { ...g, y: pos.y } : g)) };
+      } else if (kind === 'crystal') {
+        next = { ...next, crystals: next.crystals.map((c) => (c.id === id ? { ...c, y: pos.y } : c)) };
+      } else if (kind === 'start' || kind === 'goal') {
+        next = { ...next, [kind]: { ...next[kind], y: pos.y } } as Doc;
+      } else if (kind === 'ramp') {
+        next = { ...next, ramps: (next.ramps ?? []).map((r) => (r.id === id ? { ...r, y: pos.y ?? r.y } : r)) };
       }
     }
   }
@@ -896,6 +996,22 @@ export function setObjectSize(base: Doc, kind: string, id: string, size: Partial
     };
   }
 
+  if (kind === 'ramp') {
+    return {
+      ...base,
+      ramps: (base.ramps ?? []).map((r) =>
+        r.id === id
+          ? {
+              ...r,
+              length: Math.max(0.6, size.x ?? r.length),
+              rise: Math.max(0.05, size.y ?? r.rise),
+              width: Math.max(0.75, size.z ?? r.width),
+            }
+          : r
+      ),
+    };
+  }
+
   return base;
 }
 
@@ -904,6 +1020,7 @@ export function deleteDocObject(base: Doc, kind: string, id: string): Doc {
   if (kind === 'platform') return { ...base, platforms: base.platforms.filter((p) => p.id !== id) };
   if (kind === 'gap') return { ...base, gaps: base.gaps.filter((g) => g.id !== id) };
   if (kind === 'crystal') return { ...base, crystals: base.crystals.filter((c) => c.id !== id) };
+  if (kind === 'ramp') return { ...base, ramps: (base.ramps ?? []).filter((r) => r.id !== id) };
   if (kind === 'part') {
     return {
       ...base,
@@ -927,16 +1044,34 @@ export const inRect = (x: number, z: number, r: Rect, inflate = 0) =>
 export const overlaps = (a: Rect, b: Rect, gap = 0) =>
   a.xMin < b.xMax + gap && b.xMin < a.xMax + gap && a.zMin < b.zMax + gap && b.zMin < a.zMax + gap;
 
-export function shadowsAt(doc: Doc, azimuthDeg = doc.sun.azimuth): Vec2[][] {
+/** Shadow pools cast onto one horizontal plane (y = planeY). */
+export function shadowsAtPlane(doc: Doc, azimuthDeg: number, planeY: number): Vec2[][] {
   const light = sunPoint(doc, azimuthDeg);
   const light3 = { x: light.x, y: doc.sun.y, z: light.z };
   const out: Vec2[][] = [];
   for (const s of doc.pillars) {
     for (const b of s.parts) {
       if (!b.castsUmbra) continue;
-      const poly = projectBoxShadowToGround(b, light3, doc.sun.shadowRatio);
+      const poly = projectBoxShadowToPlane(b, light3, doc.sun.shadowRatio, planeY);
       if (poly.length >= 3) out.push(poly);
     }
+  }
+  return out;
+}
+
+export function shadowsAt(doc: Doc, azimuthDeg = doc.sun.azimuth): Vec2[][] {
+  return shadowsAtPlane(doc, azimuthDeg, 0);
+}
+
+/** Every shadow pool on every plane the level cares about, tagged with its plane height. */
+export function shadowSurfacesAt(doc: Doc, azimuthDeg: number): Array<{ poly: Vec2[]; y: number }> {
+  const planes = new Set<number>([0]);
+  for (const p of doc.platforms) if (p.y) planes.add(p.y);
+  for (const g of doc.gaps) if (g.y) planes.add(g.y);
+  for (const c of doc.crystals) if (c.y) planes.add(c.y);
+  const out: Array<{ poly: Vec2[]; y: number }> = [];
+  for (const h of planes) {
+    for (const poly of shadowsAtPlane(doc, azimuthDeg, h)) out.push({ poly, y: h });
   }
   return out;
 }
@@ -964,9 +1099,10 @@ export interface AzimuthState {
 
 export function stateAt(doc: Doc, azimuthDeg: number, withReach = true): AzimuthState {
   const level = toLevelData(doc);
-  const shadows = shadowsAt(doc, azimuthDeg);
-  const bridged = doc.gaps.map((g) =>
-    isGapBridged(
+  const bridged = doc.gaps.map((g) => {
+    const gy = g.y ?? 0;
+    const planePlatforms = level.platforms.filter((p) => Math.abs((p.y ?? 0) - gy) <= 0.02);
+    return isGapBridged(
       {
         id: g.id,
         xMin: g.xMin,
@@ -976,42 +1112,73 @@ export function stateAt(doc: Doc, azimuthDeg: number, withReach = true): Azimuth
         anchorA: { x: g.ax, z: g.az },
         anchorB: { x: g.bx, z: g.bz },
       },
-      level.platforms,
-      shadows,
+      planePlatforms,
+      shadowsAtPlane(doc, azimuthDeg, gy),
       blockersOf(doc)
-    )
-  );
-  const eclipsed = doc.crystals.some((c) => isCrystalEclipsed({ ...c }, shadows));
+    );
+  });
+  const eclipsed = doc.crystals.some((c) => isCrystalEclipsed({ ...c }, shadowsAtPlane(doc, azimuthDeg, c.y ?? 0)));
   let reach = false;
   if (withReach) {
     const allBridged = doc.gaps.length === 0 || bridged.every(Boolean);
-    reach = allBridged && !eclipsed && goalReachable(doc, shadows);
+    reach = allBridged && !eclipsed && goalReachable(doc, shadowSurfacesAt(doc, azimuthDeg));
   }
   return { bridged, eclipsed, reach };
 }
 
 /** Flood fill across stone + solidified shadow to confirm the goal is genuinely reachable. */
-export function goalReachable(doc: Doc, shadows: Vec2[][], step = 0.34): boolean {
-  const rects = [
-    ...doc.platforms.map((p) => (p.points && p.points.length >= 3 ? polyBounds(p.points) : norm(p))),
-    ...doc.gaps.map(norm),
+export interface ReachSurface {
+  /** Convex shadow pool or platform outline; undefined when `rect` is set. */
+  poly?: Vec2[];
+  rect?: Rect;
+  y: number;
+}
+
+/**
+ * Height-aware flood fill from the start to the goal across stones, solidified umbra
+ * and ramps. Descending between any two heights is always allowed; climbing only works
+ * on equal-height stone/shadow or up a ramp the sphere can physically roll onto.
+ */
+export function goalReachable(doc: Doc, shadowSurfaces: Array<{ poly: Vec2[]; y: number }>, step = 0.34): boolean {
+  const surfaces: ReachSurface[] = [
+    ...doc.platforms.map((p): ReachSurface =>
+      p.points && p.points.length >= 3 ? { poly: p.points, y: p.y ?? 0 } : { rect: norm(p), y: p.y ?? 0 }
+    ),
+    ...shadowSurfaces.map((s) => ({ poly: s.poly, y: s.y })),
   ];
+  const ramps = doc.ramps ?? [];
+  const blockers = blockersOf(doc);
+
   let minX = doc.start.x;
   let maxX = doc.start.x;
   let minZ = doc.start.z;
   let maxZ = doc.start.z;
-  for (const r of rects) {
-    minX = Math.min(minX, r.xMin);
-    maxX = Math.max(maxX, r.xMax);
-    minZ = Math.min(minZ, r.zMin);
-    maxZ = Math.max(maxZ, r.zMax);
+  const grow = (x: number, z: number) => {
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+  };
+  for (const p of doc.platforms) {
+    const r = norm(p);
+    grow(r.xMin, r.zMin);
+    grow(r.xMax, r.zMax);
   }
-  for (const poly of shadows) {
-    for (const p of poly) {
-      minX = Math.min(minX, p.x);
-      maxX = Math.max(maxX, p.x);
-      minZ = Math.min(minZ, p.z);
-      maxZ = Math.max(maxZ, p.z);
+  for (const g of doc.gaps) {
+    const r = norm(g);
+    grow(r.xMin, r.zMin);
+    grow(r.xMax, r.zMax);
+  }
+  for (const s of shadowSurfaces) for (const p of s.poly) grow(p.x, p.z);
+  for (const r of ramps) {
+    const hl = r.length * 0.5;
+    const hw = r.width * 0.5;
+    const f = { x: Math.sin(r.yaw), z: Math.cos(r.yaw) };
+    const rr = { x: Math.cos(r.yaw), z: -Math.sin(r.yaw) };
+    for (const a of [-1, 1]) {
+      for (const b of [-1, 1]) {
+        grow(r.x + f.x * a * hl + rr.x * b * hw, r.z + f.z * a * hl + rr.z * b * hw);
+      }
     }
   }
   minX -= 1;
@@ -1023,94 +1190,153 @@ export function goalReachable(doc: Doc, shadows: Vec2[][], step = 0.34): boolean
   const rows = Math.ceil((maxZ - minZ) / step) + 1;
   if (cols * rows > 20000) return false;
 
-  const blockers = blockersOf(doc);
-  const open = new Uint8Array(cols * rows);
+  const contains = (s: ReachSurface, x: number, z: number): boolean =>
+    s.poly ? pointInPolygon(x, z, s.poly) : inRect(x, z, s.rect!);
+
+  // layers per cell: surface indices usable at that cell
+  const cellLayers: number[][] = new Array(cols * rows);
+  const rampCells = new Map<number, Array<{ ramp: number; h: number }>>();
 
   for (let r = 0; r < rows; r++) {
     const z = minZ + r * step;
     for (let c = 0; c < cols; c++) {
       const x = minX + c * step;
-      let solid = false;
-      for (const p of doc.platforms) {
-        if (p.points && p.points.length >= 3) {
-          if (pointInPolygon(x, z, p.points)) {
-            solid = true;
-            break;
+      const idx = r * cols + c;
+      let layers: number[] | null = null;
+      for (let i = 0; i < surfaces.length; i++) {
+        if (!contains(surfaces[i], x, z)) continue;
+        const y = surfaces[i].y;
+        if (y <= 0.7) {
+          let blocked = false;
+          for (const b of blockers) {
+            if (inRect(x, z, b, 0.26)) {
+              blocked = true;
+              break;
+            }
           }
-        } else if (inRect(x, z, norm(p))) {
-          solid = true;
-          break;
+          if (blocked) continue;
         }
+        if (!layers) layers = [];
+        layers.push(i);
       }
-      if (!solid) {
-        for (const poly of shadows) {
-          if (pointInConvex(x, z, poly)) {
-            solid = true;
-            break;
-          }
+      cellLayers[idx] = layers ?? [];
+
+      if (ramps.length > 0) {
+        const here: Array<{ ramp: number; h: number }> = [];
+        for (let j = 0; j < ramps.length; j++) {
+          const h = rampHeightAt(ramps[j], x, z, 0);
+          if (h !== null) here.push({ ramp: j, h });
         }
+        if (here.length) rampCells.set(idx, here);
       }
-      if (!solid) continue;
-      let blocked = false;
-      for (const b of blockers) {
-        if (inRect(x, z, b, 0.26)) {
-          blocked = true;
-          break;
-        }
-      }
-      if (!blocked) open[r * cols + c] = 1;
     }
   }
 
+  const N = cols * rows;
   const idxOf = (x: number, z: number) => {
     const c = Math.max(0, Math.min(cols - 1, Math.round((x - minX) / step)));
     const r = Math.max(0, Math.min(rows - 1, Math.round((z - minZ) / step)));
     return r * cols + c;
   };
-
   const si = idxOf(doc.start.x, doc.start.z);
   const gi = idxOf(doc.goal.x, doc.goal.z);
-  open[si] = 1;
-  open[gi] = 1;
+  const startY = doc.start.y ?? 0;
+  const goalY = doc.goal.y ?? 0;
 
-  const seen = new Uint8Array(cols * rows);
-  const queue = new Int32Array(cols * rows);
+  // node codes: surface index i -> code i (i < 256); ramp j -> 256 + j; synthetic ground -> 1023
+  const SURF_LIM = 256;
+  const RAMP_BASE = 256;
+  const SYNTH = 1023;
+  const NODE_SPAN = 1024;
+  const nodeOf = (cell: number, code: number) => cell * NODE_SPAN + code;
+
+  const heightAt = (cell: number, code: number): number => {
+    if (code === SYNTH) return startY;
+    if (code < SURF_LIM) return surfaces[code].y;
+    const here = rampCells.get(cell);
+    if (!here) return NaN;
+    const j = code - RAMP_BASE;
+    for (const e of here) if (e.ramp === j) return e.h;
+    return NaN;
+  };
+
+  const visited = new Uint8Array(N * NODE_SPAN);
+  const queue: number[] = [];
   let head = 0;
-  let tail = 0;
-  seen[si] = 1;
-  queue[tail++] = si;
+  const push = (cell: number, code: number): boolean => {
+    const id = nodeOf(cell, code);
+    if (visited[id]) return false;
+    visited[id] = 1;
+    queue.push(id);
+    return true;
+  };
 
-  while (head < tail) {
-    const cur = queue[head++];
-    if (cur === gi) return true;
+  const seed = cellLayers[si];
+  if (seed.length === 0) {
+    push(si, SYNTH);
+  } else {
+    for (const i of seed) push(si, i);
+  }
+  const seedRamp = rampCells.get(si);
+  if (seedRamp) for (const e of seedRamp) push(si, RAMP_BASE + e.ramp);
+
+  const dirs = [
+    [-1, 0],
+    [1, 0],
+    [0, -1],
+    [0, 1],
+  ] as const;
+
+  while (head < queue.length) {
+    const id = queue[head++];
+    const cur = Math.floor(id / NODE_SPAN);
+    const code = id % NODE_SPAN;
+    const h = heightAt(cur, code);
+    if (Number.isNaN(h)) continue;
+
+    // goal reached on any node whose height is within win range of the goal terrace
+    if (cur === gi && Math.abs(h - goalY) <= 0.8) return true;
+
     const cr = Math.floor(cur / cols);
     const cc = cur % cols;
-    for (const [dr, dc] of [
-      [-1, 0],
-      [1, 0],
-      [0, -1],
-      [0, 1],
-    ]) {
+    const isRamp = code >= RAMP_BASE && code !== SYNTH;
+    const rampCode = isRamp ? code : -1;
+
+    // cells to relax: the cell itself (drop/mount in place) and its 4 neighbours
+    const targets: number[] = [cur];
+    for (const [dr, dc] of dirs) {
       const nr = cr + dr;
       const nc = cc + dc;
       if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) continue;
-      const ni = nr * cols + nc;
-      if (!seen[ni] && open[ni]) {
-        seen[ni] = 1;
-        queue[tail++] = ni;
+      targets.push(nr * cols + nc);
+    }
+
+    for (const tcell of targets) {
+      const same = tcell === cur;
+      // ramp-to-ramp along the same slope, neighbours only
+      if (isRamp && !same) {
+        const here = rampCells.get(tcell);
+        if (here) {
+          for (const e of here) {
+            if (RAMP_BASE + e.ramp === rampCode) push(tcell, rampCode);
+          }
+        }
+      }
+      // surface layers: equal height (walk) or lower (drop) — both directions of travel
+      for (const i of cellLayers[tcell]) {
+        if (surfaces[i].y <= h + 0.02) push(tcell, i);
+      }
+      // mounting a ramp requires the ramp to meet this layer height at this cell
+      const here = rampCells.get(tcell);
+      if (here) {
+        for (const e of here) {
+          const slope = ramps[e.ramp].length > 1e-6 ? Math.abs(ramps[e.ramp].rise / ramps[e.ramp].length) : 0;
+          if (Math.abs(e.h - h) <= 0.02 + step * slope) push(tcell, RAMP_BASE + e.ramp);
+        }
       }
     }
   }
   return false;
-}
-
-function pointInConvex(x: number, z: number, poly: Vec2[]): boolean {
-  for (let i = 0; i < poly.length; i++) {
-    const a = poly[i];
-    const b = poly[(i + 1) % poly.length];
-    if ((b.x - a.x) * (z - a.z) - (b.z - a.z) * (x - a.x) < -1e-6) return false;
-  }
-  return true;
 }
 
 /* ------------------------------------------------------------ analysis */
@@ -1178,10 +1404,11 @@ export function analyse(
       const end = Math.min(AZ_COUNT, i + 6);
       for (; i < end; i++) {
         const az = azOfIndex(i);
-        const shadows = shadowsAt(doc, az);
         const level = toLevelData(doc);
         const blockers = blockersOf(doc);
         doc.gaps.forEach((g, gi) => {
+          const gy = g.y ?? 0;
+          const planePlatforms = level.platforms.filter((p) => Math.abs((p.y ?? 0) - gy) <= 0.02);
           perGap[gi][i] = isGapBridged(
             {
               id: g.id,
@@ -1192,15 +1419,15 @@ export function analyse(
               anchorA: { x: g.ax, z: g.az },
               anchorB: { x: g.bx, z: g.bz },
             },
-            level.platforms,
-            shadows,
+            planePlatforms,
+            shadowsAtPlane(doc, az, gy),
             blockers
           );
         });
-        const ecl = doc.crystals.some((c) => isCrystalEclipsed({ ...c }, shadows));
+        const ecl = doc.crystals.some((c) => isCrystalEclipsed({ ...c }, shadowsAtPlane(doc, az, c.y ?? 0)));
         eclipse[i] = ecl;
         const all = doc.gaps.length === 0 || perGap.every((row) => row[i]);
-        reach[i] = all && !ecl && goalReachable(doc, shadows, 0.4);
+        reach[i] = all && !ecl && goalReachable(doc, shadowSurfacesAt(doc, az), 0.4);
       }
       onProgress?.(i / AZ_COUNT);
       if (i >= AZ_COUNT) {
@@ -1245,6 +1472,7 @@ export type SelectionKind =
   | 'start'
   | 'goal'
   | 'sun'
+  | 'ramp'
   | 'none';
 
 export function boundsOf(doc: Doc): Rect {
@@ -1371,15 +1599,22 @@ export function validate(doc: Doc): Issue[] {
   }
 
   const solidPlatforms = doc.platforms.filter((p) => p.style !== 'pedestal');
-  const onStone = (x: number, z: number) =>
-    solidPlatforms.some((p) =>
-      p.points && p.points.length >= 3 ? pointInPolygon(x, z, p.points) : inRect(x, z, norm(p))
-    );
+  const onSurface = (x: number, z: number, y: number) => {
+    for (const p of solidPlatforms) {
+      if (Math.abs((p.y ?? 0) - y) > 0.35) continue;
+      if (p.points && p.points.length >= 3 ? pointInPolygon(x, z, p.points) : inRect(x, z, norm(p))) return true;
+    }
+    for (const r of doc.ramps ?? []) {
+      const h = rampHeightAt(r, x, z, 0.05);
+      if (h !== null && Math.abs(h - y) <= 0.35) return true;
+    }
+    return false;
+  };
 
-  if (!onStone(doc.start.x, doc.start.z)) {
+  if (!onSurface(doc.start.x, doc.start.z, doc.start.y ?? 0)) {
     push({ code: 'start-void', severity: 'error', message: 'The sphere starts over the void and will fall on load.', target: { kind: 'start', id: 'start' } });
   }
-  if (!onStone(doc.goal.x, doc.goal.z)) {
+  if (!onSurface(doc.goal.x, doc.goal.z, doc.goal.y ?? 0)) {
     push({ code: 'goal-void', severity: 'error', message: 'The goal sits over the void.', target: { kind: 'goal', id: 'goal' } });
   }
 
@@ -1388,11 +1623,27 @@ export function validate(doc: Doc): Issue[] {
     ['start', doc.start, 'start'],
     ['goal', doc.goal, 'goal'],
   ] as const) {
+    if ((pt.y ?? 0) > 0.7) continue;
     for (const b of blockers) {
       if (inRect(pt.x, pt.z, b, 0.55)) {
         push({ code: `${label}-blocked`, severity: 'error', message: `A caster or crystal blocks the ${label}; the sphere cannot reach it.`, target: { kind, id: label } });
         break;
       }
+    }
+  }
+
+  for (const r of doc.ramps ?? []) {
+    if (!(r.length >= 0.5) || !(r.width >= 0.3)) {
+      push({ code: 'ramp-degenerate', severity: 'error', message: 'A ramp with near-zero length or width cannot carry the sphere.', target: { kind: 'ramp', id: r.id } });
+    }
+    const high = r.y + r.rise;
+    const nearHigh = doc.platforms.some((p) => Math.abs((p.y ?? 0) - high) <= 0.15) || (doc.ramps ?? []).some((o) => o.id !== r.id && Math.abs(o.y + o.rise - high) <= 0.15);
+    const nearLow = doc.platforms.some((p) => Math.abs((p.y ?? 0) - r.y) <= 0.15) || (doc.ramps ?? []).some((o) => o.id !== r.id && Math.abs(o.y - r.y) <= 0.15);
+    if (!nearLow && Math.abs(r.y) > 0.02) {
+      push({ code: 'ramp-low-floating', severity: 'warn', message: 'The low end of a ramp should sit on a stone (y matches no platform).', target: { kind: 'ramp', id: r.id } });
+    }
+    if (!nearHigh) {
+      push({ code: 'ramp-high-floating', severity: 'warn', message: 'The high end of a ramp should land on a stone (y + rise matches no platform).', target: { kind: 'ramp', id: r.id } });
     }
   }
 
@@ -1447,8 +1698,8 @@ export function validate(doc: Doc): Issue[] {
         target: { kind: 'gap', id: g.id },
       });
     }
-    const aOn = onStone(g.ax, g.az);
-    const bOn = onStone(g.bx, g.bz);
+    const aOn = onSurface(g.ax, g.az, g.y ?? 0);
+    const bOn = onSurface(g.bx, g.bz, g.y ?? 0);
     if (!aOn || !bOn) {
       push({
         code: 'gap-anchor-off',
@@ -1460,7 +1711,7 @@ export function validate(doc: Doc): Issue[] {
   });
 
   for (const c of doc.crystals) {
-    const near = onStone(c.x, c.z);
+    const near = onSurface(c.x, c.z, c.y ?? 0);
     if (!near) {
       push({ code: 'crystal-void', severity: 'error', message: 'A sun crystal floats over the void; it must sit on stone.', target: { kind: 'crystal', id: c.id } });
     }
@@ -1559,6 +1810,7 @@ export function toTS(doc: Doc): string {
       zMin: n(p.zMin),
       zMax: n(p.zMax),
       style: `'${p.style ?? 'main'}'`,
+      y: p.y !== undefined ? n(p.y) : undefined,
       brokenEdges: p.brokenEdges?.length ? p.brokenEdges.map((e) => `'${e}'`) : undefined,
       points: p.points?.length
         ? (`[${p.points.map((v) => `{ x: ${n(v.x)}, z: ${n(v.z)} }`).join(', ')}]` as unknown as string)
@@ -1577,12 +1829,16 @@ export function toTS(doc: Doc): string {
       zMax: n(g.zMax),
       anchorA: { x: n(g.anchorA.x), z: n(g.anchorA.z) },
       anchorB: { x: n(g.anchorB.x), z: n(g.anchorB.z) },
+      y: g.y !== undefined ? n(g.y) : undefined,
     })),
-    sunCrystals: lvl.sunCrystals?.length
-      ? lvl.sunCrystals.map((c): Node => ({ id: q(c.id), x: n(c.x), z: n(c.z), radius: n(c.radius) }))
+    ramps: lvl.ramps?.length
+      ? lvl.ramps.map((r): Node => ({ id: q(r.id), x: n(r.x), z: n(r.z), yaw: n(r.yaw), length: n(r.length), width: n(r.width), y: n(r.y), rise: n(r.rise) }))
       : undefined,
-    start: { x: n(lvl.start.x), z: n(lvl.start.z) },
-    goal: { x: n(lvl.goal.x), z: n(lvl.goal.z) },
+    sunCrystals: lvl.sunCrystals?.length
+      ? lvl.sunCrystals.map((c): Node => ({ id: q(c.id), x: n(c.x), z: n(c.z), radius: n(c.radius), y: c.y !== undefined ? n(c.y) : undefined }))
+      : undefined,
+    start: { x: n(lvl.start.x), z: n(lvl.start.z), y: lvl.start.y !== undefined ? n(lvl.start.y) : undefined },
+    goal: { x: n(lvl.goal.x), z: n(lvl.goal.z), y: lvl.goal.y !== undefined ? n(lvl.goal.y) : undefined },
     lightInitial: { x: n(lvl.lightInitial.x), y: n(lvl.lightInitial.y), z: n(lvl.lightInitial.z) },
     lightBounds: {
       maxRadius: n(lvl.lightBounds.maxRadius),

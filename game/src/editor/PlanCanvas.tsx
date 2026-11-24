@@ -14,14 +14,14 @@ import {
   rotateDocObject,
   moveDocObject,
   selectionCenter,
-  shadowsAt,
+  shadowSurfacesAt,
   snapVal,
   sunPoint,
   uid,
 } from './doc';
 import type { Vec2 } from '../game/types';
 
-export type Tool = 'select' | 'platform' | 'polygon' | 'pillar' | 'gap' | 'crystal' | 'start' | 'goal' | 'sun';
+export type Tool = 'select' | 'platform' | 'polygon' | 'pillar' | 'gap' | 'crystal' | 'start' | 'goal' | 'sun' | 'ramp';
 
 export interface Sel {
   kind: SelectionKind;
@@ -93,8 +93,8 @@ type Drag =
   | { mode: 'resize'; id: string; rect: 'platform' | 'part' | 'gap'; handle: string; start: Rect }
   | { mode: 'maybeAnchor'; id: string; which: 'a' | 'b'; ox: number; oz: number; cx: number; cy: number }
   | { mode: 'anchor'; id: string; which: 'a' | 'b'; ox: number; oz: number; lx: number; lz: number }
-  | { mode: 'maybePoint'; kind: 'crystal' | 'start' | 'goal'; id: string; ox: number; oz: number; cx: number; cy: number }
-  | { mode: 'point'; kind: 'crystal' | 'start' | 'goal'; id: string; ox: number; oz: number; lx: number; lz: number }
+  | { mode: 'maybePoint'; kind: 'crystal' | 'start' | 'goal' | 'ramp'; id: string; ox: number; oz: number; cx: number; cy: number }
+  | { mode: 'point'; kind: 'crystal' | 'start' | 'goal' | 'ramp'; id: string; ox: number; oz: number; lx: number; lz: number }
   | { mode: 'create'; type: 'platform' | 'pillar' | 'gap' | 'polygon'; ax: number; az: number; bx: number; bz: number }
   | { mode: 'vertex'; kind: 'platform'; id: string; index: number; before: Doc }
   | { mode: 'rotate'; kind: SelectionKind; id: string; center: Vec2; startAngle: number; before: Doc }
@@ -210,6 +210,26 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
     if (kind === 'gap') {
       const g = d.gaps.find((v) => v.id === id);
       return g ? norm(g) : null;
+    }
+    if (kind === 'ramp') {
+      const rp = (d.ramps ?? []).find((v) => v.id === id);
+      if (!rp) return null;
+      const f = { x: Math.sin(rp.yaw), z: Math.cos(rp.yaw) };
+      const r = { x: Math.cos(rp.yaw), z: -Math.sin(rp.yaw) };
+      const hl = rp.length / 2;
+      const hw = rp.width / 2;
+      const pts = [
+        { x: rp.x + f.x * hl + r.x * hw, z: rp.z + f.z * hl + r.z * hw },
+        { x: rp.x + f.x * hl - r.x * hw, z: rp.z + f.z * hl - r.z * hw },
+        { x: rp.x - f.x * hl + r.x * hw, z: rp.z - f.z * hl + r.z * hw },
+        { x: rp.x - f.x * hl - r.x * hw, z: rp.z - f.z * hl - r.z * hw },
+      ];
+      return {
+        xMin: Math.min(...pts.map((p) => p.x)),
+        xMax: Math.max(...pts.map((p) => p.x)),
+        zMin: Math.min(...pts.map((p) => p.z)),
+        zMax: Math.max(...pts.map((p) => p.z)),
+      };
     }
     if (kind === 'part') {
       for (const s of d.pillars) {
@@ -331,6 +351,19 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         }
       }
 
+      for (let i = (d.ramps ?? []).length - 1; i >= 0; i--) {
+        const rp = (d.ramps ?? [])[i];
+        const f = { x: Math.sin(rp.yaw), z: Math.cos(rp.yaw) };
+        const r = { x: Math.cos(rp.yaw), z: -Math.sin(rp.yaw) };
+        const dx = w.x - rp.x;
+        const dz = w.z - rp.z;
+        const tl = dx * f.x + dz * f.z;
+        const uw = dx * r.x + dz * r.z;
+        if (Math.abs(tl) <= rp.length / 2 + tol * 0.5 && Math.abs(uw) <= rp.width / 2 + tol * 0.5) {
+          return { kind: 'ramp', id: rp.id, r: 0 };
+        }
+      }
+
       for (let i = d.platforms.length - 1; i >= 0; i--) {
         const p = d.platforms[i];
         const hit = p.points && p.points.length >= 3 ? pointInPolygon(w.x, w.z, p.points) : inRectLoose(w.x, w.z, norm(p), 0);
@@ -358,6 +391,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       }
       let origin: { x: number; z: number } | null = null;
       if (kind === 'crystal') origin = base.crystals.find((c) => c.id === id) ?? null;
+      else if (kind === 'ramp') origin = base.ramps?.find((c) => c.id === id) ?? null;
       else if (kind === 'start' || kind === 'goal') origin = base[kind];
       if (!origin) return { dx, dz, moved: false };
       return { dx: snv(origin.x + dx) - origin.x, dz: snv(origin.z + dz) - origin.z, moved: true };
@@ -496,9 +530,25 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       // stay armed for dropping several crystals; V / Esc returns to Select
       return;
     }
+    if (t === 'ramp') {
+      const id = uid('r');
+      const n = (doc.ramps?.length ?? 0) + 1;
+      api.commit(
+        {
+          ...doc,
+          ramps: [
+            ...(doc.ramps ?? []),
+            { id, name: `Ramp ${n}`, x: sn(w.x), z: sn(w.z), yaw: 0, length: 3.4, width: 1.6, y: 0, rise: 1.5 },
+          ],
+        },
+        'add ramp'
+      );
+      setSel({ kind: 'ramp', id });
+      return;
+    }
     if (t === 'start' || t === 'goal') {
       const key = t === 'start' ? 'start' : 'goal';
-      api.commit({ ...doc, [key]: { x: sn(w.x), z: sn(w.z) } } as Doc, `place ${t}`);
+      api.commit({ ...doc, [key]: { ...doc[key], x: sn(w.x), z: sn(w.z) } } as Doc, `place ${t}`);
       setSel({ kind: t, id: t });
       setTool('select');
       return;
@@ -571,9 +621,10 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       setSel({ kind: 'sun', id: 'sun' });
       return;
     }
-    if (hit.kind === 'start' || hit.kind === 'goal' || hit.kind === 'crystal') {
+    if (hit.kind === 'start' || hit.kind === 'goal' || hit.kind === 'crystal' || hit.kind === 'ramp') {
       let pos = { x: 0, z: 0 };
       if (hit.kind === 'crystal') pos = doc.crystals.find((c) => c.id === hit.id) ?? pos;
+      else if (hit.kind === 'ramp') pos = doc.ramps?.find((c) => c.id === hit.id) ?? pos;
       else pos = doc[hit.kind];
       drag.current = { mode: 'maybePoint', kind: hit.kind, id: hit.id, ox: pos.x - w.x, oz: pos.z - w.z, cx: e.clientX, cy: e.clientY };
       dragPid.current = e.pointerId;
@@ -772,6 +823,10 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         if (d.kind === 'crystal') {
           return { ...doc0, crystals: doc0.crystals.map((c) => (c.id === d.id ? { ...c, x, z } : c)) };
         }
+        if (d.kind === 'ramp') {
+          return { ...doc0, ramps: (doc0.ramps ?? []).map((c) => (c.id === d.id ? { ...c, x, z } : c)) };
+        }
+        if (d.kind === 'start' || d.kind === 'goal') return { ...doc0, [d.kind]: { ...doc0[d.kind], x, z } } as Doc;
         return { ...doc0, [d.kind]: { x, z } } as Doc;
       });
     }
@@ -806,6 +861,10 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         if (kind === 'crystal') {
           return { ...doc0, crystals: doc0.crystals.map((c) => (c.id === id ? { ...c, x: fx, z: fz } : c)) };
         }
+        if (kind === 'ramp') {
+          return { ...doc0, ramps: (doc0.ramps ?? []).map((c) => (c.id === id ? { ...c, x: fx, z: fz } : c)) };
+        }
+        if (kind === 'start' || kind === 'goal') return { ...doc0, [kind]: { ...doc0[kind], x: fx, z: fz } } as Doc;
         return { ...doc0, [kind]: { x: fx, z: fz } } as Doc;
       });
     }
@@ -1119,6 +1178,59 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         }
       }
 
+      // ramps (slope walkways): footprint + uphill chevrons + elevation rise tag
+      for (const rp of d.ramps ?? []) {
+        const f = { x: Math.sin(rp.yaw), z: Math.cos(rp.yaw) };
+        const r = { x: Math.cos(rp.yaw), z: -Math.sin(rp.yaw) };
+        const hl = rp.length / 2;
+        const hw = rp.width / 2;
+        const corners = [
+          { x: rp.x - f.x * hl - r.x * hw, z: rp.z - f.z * hl - r.z * hw },
+          { x: rp.x + f.x * hl - r.x * hw, z: rp.z + f.z * hl - r.z * hw },
+          { x: rp.x + f.x * hl + r.x * hw, z: rp.z + f.z * hl + r.z * hw },
+          { x: rp.x - f.x * hl + r.x * hw, z: rp.z - f.z * hl + r.z * hw },
+        ];
+        ctx.beginPath();
+        corners.forEach((v, k) => (k ? ctx.lineTo(px(v.x), py(v.z)) : ctx.moveTo(px(v.x), py(v.z))));
+        ctx.closePath();
+        ctx.fillStyle = '#e8dfc9';
+        ctx.fill();
+        ctx.strokeStyle = C.stoneEdge;
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+        // low edge is rounded, high edge is bold — reads as "this way up"
+        const loA = corners[0];
+        const loB = corners[3];
+        ctx.strokeStyle = C.stoneEdge;
+        ctx.lineWidth = 2.5;
+        ctx.beginPath();
+        ctx.moveTo(px(loA.x), py(loA.z));
+        ctx.lineTo(px(loB.x), py(loB.z));
+        ctx.stroke();
+        const hiA = corners[1];
+        const hiB = corners[2];
+        ctx.strokeStyle = '#2f3336';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.moveTo(px(hiA.x), py(hiA.z));
+        ctx.lineTo(px(hiB.x), py(hiB.z));
+        ctx.stroke();
+        // uphill chevrons
+        ctx.strokeStyle = 'rgba(84,74,56,0.7)';
+        ctx.lineWidth = 1.6;
+        for (let s = 1; s <= 3; s++) {
+          const t = (s / 4 - 0.5) * rp.length;
+          const cxp = rp.x + f.x * t;
+          const czp = rp.z + f.z * t;
+          const w = rp.width * 0.3;
+          ctx.beginPath();
+          ctx.moveTo(px(cxp - r.x * w), py(czp - r.z * w));
+          ctx.lineTo(px(cxp + f.x * 0.34), py(czp + f.z * 0.34));
+          ctx.lineTo(px(cxp + r.x * w), py(czp + r.z * w));
+          ctx.stroke();
+        }
+      }
+
       // spans
       if (S.current.layers.spans) {
         for (const g of d.gaps) {
@@ -1174,19 +1286,34 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
 
       // shadows (merged silhouette, one covered line)
       if (S.current.layers.shadow && d.pillars.length) {
-        const polys = shadowsAt(d);
-        const loops = traceUmbraSilhouette(polys);
-        const set = loops.length ? loops : polys;
+        const surfaces = shadowSurfacesAt(d, d.sun.azimuth);
+        const byPlane = new Map<number, Vec2[][]>();
+        for (const s of surfaces) {
+          const arr = byPlane.get(s.y) ?? [];
+          arr.push(s.poly);
+          byPlane.set(s.y, arr);
+        }
         ctx.fillStyle = C.shadowFill;
         ctx.strokeStyle = C.shadowEdge;
         ctx.lineWidth = 1.5;
         ctx.lineJoin = 'round';
-        for (const loop of set) {
-          ctx.beginPath();
-          loop.forEach((p, i) => (i ? ctx.lineTo(px(p.x), py(p.z)) : ctx.moveTo(px(p.x), py(p.z))));
-          ctx.closePath();
-          ctx.fill();
-          ctx.stroke();
+        for (const [planeY, polys] of byPlane) {
+          const elevated = Math.abs(planeY) > 0.02;
+          const loops = traceUmbraSilhouette(polys);
+          const set = loops.length ? loops : polys;
+          ctx.save();
+          if (elevated) {
+            ctx.globalAlpha = 0.75;
+            ctx.setLineDash([5, 4]);
+          }
+          for (const loop of set) {
+            ctx.beginPath();
+            loop.forEach((p, i) => (i ? ctx.lineTo(px(p.x), py(p.z)) : ctx.moveTo(px(p.x), py(p.z))));
+            ctx.closePath();
+            ctx.fill();
+            ctx.stroke();
+          }
+          ctx.restore();
         }
       }
 
@@ -1390,6 +1517,33 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
         ctx.strokeStyle = C.teal;
         ctx.lineWidth = 1.6;
         ctx.stroke();
+      } else if (S.current.sel.kind === 'ramp') {
+        const rp = (d.ramps ?? []).find((v) => v.id === S.current.sel.id);
+        if (rp) {
+          const f = { x: Math.sin(rp.yaw), z: Math.cos(rp.yaw) };
+          const r = { x: Math.cos(rp.yaw), z: -Math.sin(rp.yaw) };
+          const hl = rp.length / 2;
+          const hw = rp.width / 2;
+          const corners = [
+            { x: rp.x - f.x * hl - r.x * hw, z: rp.z - f.z * hl - r.z * hw },
+            { x: rp.x + f.x * hl - r.x * hw, z: rp.z + f.z * hl - r.z * hw },
+            { x: rp.x + f.x * hl + r.x * hw, z: rp.z + f.z * hl + r.z * hw },
+            { x: rp.x - f.x * hl + r.x * hw, z: rp.z - f.z * hl + r.z * hw },
+          ];
+          ctx.save();
+          ctx.setLineDash([6, 4]);
+          ctx.lineDashOffset = -t * 26;
+          ctx.strokeStyle = '#2f3336';
+          ctx.lineWidth = 1.8;
+          ctx.beginPath();
+          corners.forEach((v, k) => (k ? ctx.lineTo(px(v.x), py(v.z)) : ctx.moveTo(px(v.x), py(v.z))));
+          ctx.closePath();
+          ctx.stroke();
+          ctx.restore();
+          ctx.fillStyle = '#2f3336';
+          ctx.font = '500 10.5px "JetBrains Mono", monospace';
+          ctx.fillText(`${rp.length.toFixed(2)} × ${rp.width.toFixed(2)} · +${rp.rise.toFixed(2)}`, px(corners[0].x), py(corners[0].z) + 18);
+        }
       } else if (sr) {
         const r = rr(sr);
         ctx.save();
@@ -1447,6 +1601,26 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
           ctx.stroke();
           ctx.restore();
         }
+      }
+
+      // elevation badges (dims layer): anything standing above or below the court floor
+      if (S.current.layers.dims) {
+        const elevTag = (x: number, z: number, y: number) => {
+          if (Math.abs(y) < 1e-6) return;
+          const label = `${y > 0 ? '+' : '−'}${Math.abs(y).toFixed(2)}`;
+          ctx.font = '600 9px "JetBrains Mono", monospace';
+          const w = ctx.measureText(label).width + 10;
+          ctx.fillStyle = 'rgba(47,51,54,0.85)';
+          ctx.fillRect(px(x) - w / 2, py(z) + 10, w, 14);
+          ctx.fillStyle = '#f6d089';
+          ctx.fillText(label, px(x) - w / 2 + 5, py(z) + 20);
+        };
+        for (const p of d.platforms) elevTag((p.xMin + p.xMax) / 2, (p.zMin + p.zMax) / 2, p.y ?? 0);
+        for (const g of d.gaps) elevTag((g.xMin + g.xMax) / 2, (g.zMin + g.zMax) / 2, g.y ?? 0);
+        for (const c of d.crystals) elevTag(c.x, c.z, c.y ?? 0);
+        for (const rp of d.ramps ?? []) elevTag(rp.x, rp.z, rp.y ?? 0);
+        elevTag(d.start.x, d.start.z, d.start.y ?? 0);
+        elevTag(d.goal.x, d.goal.z, d.goal.y ?? 0);
       }
 
       // north arrow + scale bar
