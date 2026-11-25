@@ -1032,7 +1032,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
             {[
               ['V / P / C / G', 'select · stone · caster · span'],
               ['T / X / B / E / L', 'ramp · crystal · start · goal · light'],
-              ['Drag', 'create or move · alt = free'],
+              ['Drag', 'create · resize · Alt = free'],
               ['Wheel', 'zoom · space-drag to pan'],
               ['F', 'fit sheet to the level'],
               ['Space', 'swap sheet and stage'],
