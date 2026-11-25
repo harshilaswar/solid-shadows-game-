@@ -378,27 +378,6 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
     [handlesOf, rectOf, toWorld]
   );
 
-  /** Snap a move delta once, at release. Works for rects and point markers alike. */
-  const snappedDeltaFor = useCallback(
-    (kind: SelectionKind, id: string, base: Doc, dx: number, dz: number) => {
-      const g = S.current.grid;
-      const snv = (v: number) => (g > 0 ? Math.round(v / g) * g : v);
-      const b = rectOf(kind, id, base);
-      if (b) {
-        const ndx = snv(b.xMin + dx) - b.xMin;
-        const ndz = snv(b.zMin + dz) - b.zMin;
-        return { dx: ndx, dz: ndz, moved: true };
-      }
-      let origin: { x: number; z: number } | null = null;
-      if (kind === 'crystal') origin = base.crystals.find((c) => c.id === id) ?? null;
-      else if (kind === 'ramp') origin = base.ramps?.find((c) => c.id === id) ?? null;
-      else if (kind === 'start' || kind === 'goal') origin = base[kind];
-      if (!origin) return { dx, dz, moved: false };
-      return { dx: snv(origin.x + dx) - origin.x, dz: snv(origin.z + dz) - origin.z, moved: true };
-    },
-    [rectOf]
-  );
-
   /* ----------------------------------------------------------- mutate */
 
   /** Move any object from the drag-start snapshot by the accumulated delta. */
@@ -716,8 +695,9 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return;
     }
     if (d.mode === 'create') {
-      d.bx = sn(w.x);
-      d.bz = sn(w.z);
+      const snw = (v: number) => (e.altKey ? v : sn(v));
+      d.bx = snw(w.x);
+      d.bz = snw(w.z);
       return;
     }
     if (d.mode === 'rotate') {
@@ -734,8 +714,9 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return;
     }
     if (d.mode === 'vertex') {
-      const x = sn(w.x);
-      const z = sn(w.z);
+      const snw = (v: number) => (e.altKey ? v : sn(v));
+      const x = snw(w.x);
+      const z = snw(w.z);
       api.live(() => ({
         ...d.before,
         platforms: d.before.platforms.map((p) => {
@@ -752,8 +733,9 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return;
     }
     if (d.mode === 'maybeMove') {
-      const threshold = e.pointerType === 'touch' ? 12 : 6;
-      if (Math.hypot(e.clientX - d.cx, e.clientY - d.cy) <= threshold) return;
+      // engage on the slightest travel: a press that never moves is still a tap,
+      // and there is no dead zone between press and follow
+      if (Math.hypot(e.clientX - d.cx, e.clientY - d.cy) < 1) return;
       // engage: promote the pending tap into a real drag that follows 1:1
       drag.current = { mode: 'move', kind: d.kind, id: d.id, wx: d.wx, wz: d.wz, lx: w.x, lz: w.z, before: d.before };
       applyDelta(d.before, d.kind, d.id, w.x - d.wx, w.z - d.wz);
@@ -768,8 +750,9 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return;
     }
     if (d.mode === 'resize') {
-      const x = sn(w.x);
-      const z = sn(w.z);
+      const snw = (v: number) => (e.altKey ? v : sn(v));
+      const x = snw(w.x);
+      const z = snw(w.z);
       let { xMin, xMax, zMin, zMax } = d.start;
       if (d.handle.includes('w')) xMin = Math.min(x, xMax - 0.25);
       if (d.handle.includes('e')) xMax = Math.max(x, xMin + 0.25);
@@ -794,8 +777,7 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       return;
     }
     if (d.mode === 'maybePoint' || d.mode === 'maybeAnchor') {
-      const threshold = e.pointerType === 'touch' ? 12 : 6;
-      if (Math.hypot(e.clientX - d.cx, e.clientY - d.cy) <= threshold) return;
+      if (Math.hypot(e.clientX - d.cx, e.clientY - d.cy) < 1) return;
       if (d.mode === 'maybePoint') {
         drag.current = { mode: 'point', kind: d.kind, id: d.id, ox: d.ox, oz: d.oz, lx: w.x, lz: w.z };
       } else {
@@ -843,37 +825,9 @@ export function PlanCanvas({ doc, api, sel, setSel, tool, setTool, grid, snap, l
       finishDrag(e.pointerId);
       return;
     }
-    if (d.mode === 'anchor' && S.current.snap && S.current.grid > 0 && !e.altKey) {
-      const which = d.which;
-      const fx = sn(d.lx + d.ox);
-      const fz = sn(d.lz + d.oz);
-      api.live((doc0) => ({
-        ...doc0,
-        gaps: doc0.gaps.map((g) => (g.id === d.id ? { ...g, ...(which === 'a' ? { ax: fx, az: fz } : { bx: fx, bz: fz }) } : g)),
-      }));
-    }
-    if (d.mode === 'point' && S.current.snap && S.current.grid > 0 && !e.altKey) {
-      const fx = sn(d.lx + d.ox);
-      const fz = sn(d.lz + d.oz);
-      const kind = d.kind;
-      const id = d.id;
-      api.live((doc0) => {
-        if (kind === 'crystal') {
-          return { ...doc0, crystals: doc0.crystals.map((c) => (c.id === id ? { ...c, x: fx, z: fz } : c)) };
-        }
-        if (kind === 'ramp') {
-          return { ...doc0, ramps: (doc0.ramps ?? []).map((c) => (c.id === id ? { ...c, x: fx, z: fz } : c)) };
-        }
-        if (kind === 'start' || kind === 'goal') return { ...doc0, [kind]: { ...doc0[kind], x: fx, z: fz } } as Doc;
-        return { ...doc0, [kind]: { x: fx, z: fz } } as Doc;
-      });
-    }
-    if (d.mode === 'move' && S.current.snap && S.current.grid > 0 && !e.altKey) {
-      const rawDx = d.lx - d.wx;
-      const rawDz = d.lz - d.wz;
-      const snapped = snappedDeltaFor(d.kind, d.id, d.before, rawDx, rawDz);
-      if (snapped.moved) applyDelta(d.before, d.kind, d.id, snapped.dx, snapped.dz);
-    }
+    // No end-of-drag "snap pop": whatever the pointer last placed is kept
+    // exactly. Grid alignment stays available via the snap toggle for
+    // placement/resize, the Arrow keys and "Snap all to grid".
     finishDrag(e.pointerId, true);
     if (d.mode === 'maybePan' || d.mode === 'pan' || d.mode === 'maybeMove' || d.mode === 'maybePoint' || d.mode === 'maybeAnchor') return;
 
