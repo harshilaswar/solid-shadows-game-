@@ -419,3 +419,32 @@
 .fg-tool {
   flex: none;
 }
+
+/* ------------------------------------------------------- 3D block palette */
+
+.fg-blockbtn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 32px;
+  padding: 4px 5px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.fg-blockbtn:hover {
+  background: #262b2e;
+  border-color: #3b4245;
+}
+.fg-blockbtn[data-on='true'] {
+  background: #302a1d;
+  border-color: #6b5a34;
+}
+.fg-blockbtn[data-on='true'] span:last-child span:first-child {
+  color: var(--amber);
+}
+.fg-blockbtn > span:first-child svg {
+  color: rgba(30, 27, 21, 0.72);
+}

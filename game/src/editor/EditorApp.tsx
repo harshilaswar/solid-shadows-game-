@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import {
   ArrowLeft,
   Box,
+  Boxes,
   Circle,
   Copy,
   Download,
@@ -38,6 +39,7 @@ import { UmbraCanvas, type GameSettings } from '../components/UmbraCanvas';
 import { LEVELS } from '../game/levels';
 import { sound } from '../game/sound';
 import { AzimuthRuler, shadowFootprint } from './AzimuthRuler';
+import { VoxelEditor3D } from './VoxelEditor3D';
 import {
   analyse,
   type Analysis,
@@ -89,7 +91,7 @@ const LAYER_DEFS: Array<{ id: keyof PlanLayers; name: string }> = [
   { id: 'dims', name: 'Dims' },
 ];
 
-type View = 'plan' | 'split' | 'preview';
+type View = 'plan' | 'build' | 'split' | 'preview';
 
 function useDebounced<T>(value: T, ms: number): T {
   const [v, setV] = useState(value);
@@ -119,7 +121,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
   const [tool, setTool] = useState<Tool>('select');
   const [grid, setGrid] = useState(0.25);
   const [snapOn, setSnapOn] = useState(true);
-  const [view, setView] = useState<View>('plan');
+  const [view, setView] = useState<View>('build');
   const [layers, setLayers] = useState<PlanLayers>({
     grid: true,
     shadow: true,
@@ -370,6 +372,31 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
       if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
       const mod = e.metaKey || e.ctrlKey;
 
+      // In 3D build mode the numbers, R, X, V and [ ] belong to the block
+      // palette, which installs its own key handler.
+      if (view === 'build') {
+        if (mod && e.key.toLowerCase() === 'z') {
+          e.preventDefault();
+          e.shiftKey ? api.redo() : api.undo();
+          return;
+        }
+        if (mod && e.key.toLowerCase() === 's') {
+          e.preventDefault();
+          storeNow();
+          flash('Saved to this browser');
+          return;
+        }
+        if (e.key === 'Escape') {
+          if (playLevel) setPlayLevel(null);
+          else if (modal) setModal(null);
+        }
+        if (e.key === ' ') {
+          e.preventDefault();
+          setView('plan');
+        }
+        return;
+      }
+
       if (mod && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         e.shiftKey ? api.redo() : api.undo();
@@ -434,7 +461,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [api, modal, playLevel, runAnalysis, storeNow, chooseTool, cycleSelection]);
+  }, [api, modal, playLevel, runAnalysis, storeNow, chooseTool, cycleSelection, view]);
 
   const importJson = () => {
     try {
@@ -489,7 +516,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
 
         <div className="mx-auto flex shrink-0 items-center gap-1">
           <div className="fg-seg mr-1 flex border border-[var(--line)]">
-            {(['plan', 'split', 'preview'] as View[]).map((v) => (
+            {(['plan', 'build', 'split', 'preview'] as View[]).map((v) => (
               <button
                 key={v}
                 data-on={view === v}
@@ -499,10 +526,10 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
                   sound.playUiClick();
                   setView(v);
                 }}
-                title={`${v === 'plan' ? 'Drafting sheet' : v === 'split' ? 'Sheet and stage' : 'Live stage'} (Space toggles plan/stage)`}
+                title={v === 'build' ? '3D block forge — build with blocks at any height' : `${v === 'plan' ? 'Drafting sheet' : v === 'split' ? 'Sheet and stage' : 'Live stage'} (Space toggles plan/stage)`}
               >
-                {v === 'plan' ? <LayoutGrid className="h-3.5 w-3.5" /> : v === 'split' ? <Grid3x3 className="h-3.5 w-3.5" /> : <Box className="h-3.5 w-3.5" />}
-                <span className="hidden md:inline">{v}</span>
+                {v === 'plan' ? <LayoutGrid className="h-3.5 w-3.5" /> : v === 'build' ? <Boxes className="h-3.5 w-3.5" /> : v === 'split' ? <Grid3x3 className="h-3.5 w-3.5" /> : <Box className="h-3.5 w-3.5" />}
+                <span className="hidden md:inline">{v === 'build' ? '3D' : v}</span>
               </button>
             ))}
           </div>
@@ -556,7 +583,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
       {/* ------------------------------------------------------------ body */}
       <div className="relative flex min-h-0 flex-1">
         {/* tool rail */}
-        <nav className="fg-noscroll flex w-[62px] flex-none flex-col items-stretch gap-0.5 overflow-y-auto border-r border-[var(--line)] bg-[var(--panel)] p-1.5">
+        <nav className={`${view === 'build' ? 'hidden' : 'flex'} fg-noscroll w-[62px] flex-none flex-col items-stretch gap-0.5 overflow-y-auto border-r border-[var(--line)] bg-[var(--panel)] p-1.5`}>
           {TOOLS.map((t) => (
             <button
               key={t.id}
@@ -634,7 +661,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
         {/* canvas stack */}
         <main className="relative flex min-w-0 flex-1">
           {/* selection actions: rotate, reshape, delete — floating above the sheet */}
-          <div className="pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2">
+          <div className={`${view === 'build' ? 'hidden' : ''} pointer-events-none absolute left-1/2 top-3 z-20 -translate-x-1/2`}>
             <div className="pointer-events-auto flex items-center gap-1.5 border border-[var(--line)] bg-[#1e2225]/95 px-1.5 py-1 shadow-lg backdrop-blur-sm">
               <span className="forge-label small px-1.5">
                 {sel.kind === 'none' ? 'Nothing selected' : sel.kind}
@@ -698,7 +725,7 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
 
             {/* polygon sides — visible while the n-gon tool is armed or a polygon is selected */}
             {(tool === 'polygon' || sel.kind === 'platform') && (
-              <div className="pointer-events-auto mt-1 flex items-center gap-1 border border-[var(--line)] bg-[#1e2225]/95 px-1.5 py-1 shadow-lg backdrop-blur-sm">
+              <div className={`${view === 'build' ? 'hidden' : ''} pointer-events-auto mt-1 flex items-center gap-1 border border-[var(--line)] bg-[#1e2225]/95 px-1.5 py-1 shadow-lg backdrop-blur-sm`}>
                 <span className="forge-label small px-1">Sides</span>
                 {[3, 4, 5, 6, 7, 8, 12].map((n) => (
                   <button
@@ -718,9 +745,13 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
             )}
           </div>
 
-          {view !== 'preview' && <TransformPanel doc={doc} api={api} sel={sel} />}
+          {view === 'build' ? (
+            <VoxelEditor3D doc={doc} api={api} onReadout={setReadout} onToast={flash} />
+          ) : (
+            <>
+            {view !== 'preview' && <TransformPanel doc={doc} api={api} sel={sel} />}
 
-          {view !== 'preview' && (
+            {view !== 'preview' && (
             <div className={view === 'split' ? 'w-1/2 border-r border-[var(--line)]' : 'flex-1'}>
               <PlanCanvas
                 doc={doc}
@@ -739,9 +770,9 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
                 onRotation={setLiveRotation}
               />
             </div>
-          )}
+            )}
 
-          {view !== 'plan' && (
+            {view !== 'plan' && (
             <div className={view === 'split' ? 'w-1/2' : 'flex-1'}>
               <div className="relative h-full w-full bg-[#c9c0ae]">
                 <UmbraCanvas
@@ -759,19 +790,19 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
                   <span className="forge-mono text-[9px] text-[var(--muted)]">updates when you stop editing</span>
                 </div>
                 <div className="absolute bottom-3 left-3 flex gap-1">
-                  {LAYER_DEFS.map((l) => (
+                    {LAYER_DEFS.map((l) => (
                     <button
                       key={l.id}
                       data-on={layers[l.id]}
                       className="fg-chip glass"
                       onClick={() => setLayers((s) => ({ ...s, [l.id]: !s[l.id] }))}
                     >
-                      {l.name}
+                        {l.name}
                     </button>
                   ))}
                 </div>
                 <div className="absolute right-3 top-3 flex flex-col gap-1">
-                  {(['low', 'medium', 'high'] as const).map((q) => (
+                    {(['low', 'medium', 'high'] as const).map((q) => (
                     <button
                       key={q}
                       data-on={settings.quality === q}
@@ -779,12 +810,14 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
                       onClick={() => setSettings((s) => ({ ...s, quality: q }))}
                       title="Render scale"
                     >
-                      {q}
+                        {q}
                     </button>
                   ))}
                 </div>
               </div>
             </div>
+            )}
+            </>
           )}
         </main>
 
@@ -1032,6 +1065,10 @@ export function EditorApp({ onExit }: { onExit?: () => void } = {}) {
             {[
               ['V / P / C / G', 'select · stone · caster · span'],
               ['T / X / B / E / L', 'ramp · crystal · start · goal · light'],
+              ['3D view', 'palette on the left · click to place blocks'],
+              ['1 – 0 / R', 'block type / turn a ramp'],
+              ['[ / ]', 'build layer down / up'],
+              ['shift+click', 'erase a block in 3D'],
               ['Drag', 'create · resize · Alt = free'],
               ['Wheel', 'zoom · space-drag to pan'],
               ['F', 'fit sheet to the level'],
