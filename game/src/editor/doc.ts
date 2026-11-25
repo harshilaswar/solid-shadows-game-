@@ -3,7 +3,9 @@ import type { LevelData, Vec2, Vec3 } from '../game/types';
 import {
   isCrystalEclipsed,
   isGapBridged,
+  outlineOf,
   projectBoxShadowToPlane,
+  projectOutlineShadowToPlane,
   rampHeightAt,
   sunShadowOffsetPerHeight,
 } from '../game/shadowMath';
@@ -1044,6 +1046,9 @@ export const inRect = (x: number, z: number, r: Rect, inflate = 0) =>
 export const overlaps = (a: Rect, b: Rect, gap = 0) =>
   a.xMin < b.xMax + gap && b.xMin < a.xMax + gap && a.zMin < b.zMax + gap && b.zMin < a.zMax + gap;
 
+/** Solid depth of a platform's stone body, measured from its top face down (slab + body + plinth). */
+const PLATFORM_BODY_DEPTH = 1.16;
+
 /** Shadow pools cast onto one horizontal plane (y = planeY). */
 export function shadowsAtPlane(doc: Doc, azimuthDeg: number, planeY: number): Vec2[][] {
   const light = sunPoint(doc, azimuthDeg);
@@ -1055,6 +1060,14 @@ export function shadowsAtPlane(doc: Doc, azimuthDeg: number, planeY: number): Ve
       const poly = projectBoxShadowToPlane(b, light3, doc.sun.shadowRatio, planeY);
       if (poly.length >= 3) out.push(poly);
     }
+  }
+  // floating stones throw their own umbra onto every lower plane — usable to
+  // bridge spans, smother the sun crystal, and feed the solver/analysis
+  for (const p of doc.platforms) {
+    const py = p.y ?? 0;
+    if (py <= planeY) continue;
+    const poly = projectOutlineShadowToPlane(outlineOf(p), py, PLATFORM_BODY_DEPTH, light3, doc.sun.shadowRatio, planeY);
+    if (poly.length >= 3) out.push(poly);
   }
   return out;
 }

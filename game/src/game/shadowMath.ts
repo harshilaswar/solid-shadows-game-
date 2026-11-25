@@ -168,6 +168,40 @@ export function projectBoxShadowToPlane(
 }
 
 /**
+ * Projects a flat horizontal outline (top face at `topY`, solid body extending `bodyHeight` down)
+ * onto a horizontal plane (y = planeY) using parallel (directional) sunlight. Floating stones
+ * cast their umbra onto the court and onto lower terraces exactly the same way caster blocks do,
+ * so a suspended slab can bridge a span or smother a sun crystal when swung into the light.
+ * Parts of the body below the receiving plane cast nothing onto it.
+ */
+export function projectOutlineShadowToPlane(
+  outline: Vec2[],
+  topY: number,
+  bodyHeight: number,
+  light: Vec3,
+  ratio = DEFAULT_SHADOW_RATIO,
+  planeY = 0
+): Vec2[] {
+  if (outline.length < 3) return [];
+  if (topY <= planeY) return [];
+
+  const bottomY = topY - Math.max(0.01, bodyHeight);
+  const off = sunShadowOffsetPerHeight(light, ratio);
+
+  const offsets = new Set<number>([0]);
+  if (bottomY > planeY) offsets.add(bottomY - planeY);
+  offsets.add(topY - planeY);
+
+  const projected: Vec2[] = [];
+  for (const h of offsets) {
+    for (const v of outline) {
+      projected.push({ x: v.x + off.x * h, z: v.z + off.z * h });
+    }
+  }
+  return convexHull2D(projected);
+}
+
+/**
  * Projects a 3D axis-aligned box onto the y = 0 ground plane using parallel (directional) sunlight.
  * Because rays are parallel, the shadow keeps the exact footprint width of the pillar and a
  * constant length for a given sun elevation — it is simply swept along the sun direction.

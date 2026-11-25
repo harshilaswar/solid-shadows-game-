@@ -14,7 +14,9 @@ import {
   distanceToRect,
   isCrystalEclipsed,
   isGapBridged,
+  outlineOf,
   projectBoxShadowToPlane,
+  projectOutlineShadowToPlane,
   rampHeightAt,
   resolveCircleRectCollision,
   resolveCircleRotRectCollision,
@@ -68,6 +70,9 @@ interface UmbraCanvasProps {
 }
 
 const BALL_RADIUS = 0.32;
+
+/** Solid depth of a platform's stone body, measured from its top face down (slab + body + plinth). */
+const PLATFORM_BODY_DEPTH = 1.16;
 
 interface SupportHit {
   height: number;
@@ -645,8 +650,10 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         slabFromOutline(outline, 0.14, platTopMat, 0, true, platGroup);
         slabFromOutline(shrinkOutline(outline, 0.06), 0.58, matStoneSide, -0.14, false, platGroup);
         slabFromOutline(shrinkOutline(outline, 0.2), 0.44, matStoneDeep, -0.72, false, platGroup);
-        // support cliff running from the plinth down into the flooded chasm (always rooted at world -2.36)
-        slabFromOutline(shrinkOutline(outline, 0.34), Math.max(0, platY) + 1.2, matStoneDeep, -1.16, false, platGroup);
+        // Elevated lodestones float — no support cliff rooted in the chasm. Never-root platY stays the same at ground level.
+        if (Math.abs(platY) <= 0.02) {
+          slabFromOutline(shrinkOutline(outline, 0.34), 1.2, matStoneDeep, -1.16, false, platGroup);
+        }
 
         // inset inlay copied inward from every edge midpoint
         const inset = shrinkOutline(outline, 0.22);
@@ -692,14 +699,16 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
         plinthMesh.castShadow = true;
         platGroup.add(plinthMesh);
 
-        // support cliff rooting the plinth down into the chasm (world y -2.36)
-        const cliffH = Math.max(0, platY) + 1.2;
-        const cliffGeo = track(new THREE.BoxGeometry(Math.max(0.2, w - 0.6), cliffH, Math.max(0.2, d - 0.6)));
-        const cliffMesh = new THREE.Mesh(cliffGeo, matStoneDeep);
-        cliffMesh.position.set(cx, -1.16 - cliffH * 0.5 + 0.0, cz);
-        cliffMesh.receiveShadow = true;
-        cliffMesh.castShadow = true;
-        platGroup.add(cliffMesh);
+        // Elevated lodestones float — a cliff only roots stones sitting on the court floor
+        if (Math.abs(platY) <= 0.02) {
+          const cliffH = 1.2;
+          const cliffGeo = track(new THREE.BoxGeometry(Math.max(0.2, w - 0.6), cliffH, Math.max(0.2, d - 0.6)));
+          const cliffMesh = new THREE.Mesh(cliffGeo, matStoneDeep);
+          cliffMesh.position.set(cx, -1.16 - cliffH * 0.5 + 0.0, cz);
+          cliffMesh.receiveShadow = true;
+          cliffMesh.castShadow = true;
+          platGroup.add(cliffMesh);
+        }
 
         if (w > 1.2 && d > 1.2) {
           const inset = 0.2;
@@ -1642,6 +1651,14 @@ export const UmbraCanvas: React.FC<UmbraCanvasProps> = ({
             const poly = projectBoxShadowToPlane(box, sim.lightPos, shadowRatio, h);
             if (poly.length >= 3) planePolys.push(poly);
           }
+        }
+        // floating stones throw their own umbra: usable to bridge spans, smother the
+        // sun crystal, and (across a bridged gap) to stand on — same rules as casters
+        for (const plat of level.platforms) {
+          const platY = plat.y ?? 0;
+          if (platY <= h) continue;
+          const poly = projectOutlineShadowToPlane(outlineOf(plat), platY, PLATFORM_BODY_DEPTH, sim.lightPos, shadowRatio, h);
+          if (poly.length >= 3) planePolys.push(poly);
         }
         shadowsByPlane.set(h, planePolys);
       }
