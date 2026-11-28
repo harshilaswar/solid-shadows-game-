@@ -575,6 +575,13 @@ export function VoxelEditor3D({ doc, api, onReadout, onToast }: Props) {
   );
 
   const selectedVoxel = voxels.find((v) => v.id === selected);
+  const updateSelected = (patch: Partial<Pick<Voxel, 'x' | 'y' | 'z' | 'rot'>>) => {
+    if (!selectedVoxel) return;
+    const next = { ...selectedVoxel, ...patch };
+    const occupied = voxels.some((v) => v.id !== selectedVoxel.id && voxelKey(v) === voxelKey(next));
+    if (occupied) { onToast?.('That transform would overlap another block'); return; }
+    apply(voxels.map((v) => v.id === selectedVoxel.id ? next : v));
+  };
 
   return (
     <div className="flex h-full w-full min-w-0">
@@ -680,7 +687,43 @@ export function VoxelEditor3D({ doc, api, onReadout, onToast }: Props) {
           </div>
         </div>
 
-        <div className="absolute right-3 top-3 flex flex-col gap-1">
+        <div className="absolute right-3 top-3 z-10 w-[220px] max-h-[calc(100%-24px)] overflow-y-auto border border-[#ffffff30] bg-[#14171aeF] p-2 text-[#f0e9da] shadow-xl backdrop-blur-md max-sm:w-[174px]">
+          <div className="mb-2 flex items-center justify-between">
+            <span className="forge-label amber">Transform</span>
+            <span className="forge-mono text-[9px] text-[#aaa394]">{selectedVoxel ? blockDef(selectedVoxel.kind).name : 'No selection'}</span>
+          </div>
+          {selectedVoxel ? <>
+            <div className="forge-mono mb-1 text-[9px] text-[#aaa394]">LOCATION · world units</div>
+            <div className="grid grid-cols-3 gap-1">
+              {(['x','y','z'] as const).map((axis) => <label key={axis} className="text-center">
+                <span className="forge-mono block text-[9px] text-[#d6ad5d]">{axis.toUpperCase()}</span>
+                <input aria-label={`Position ${axis}`} type="number" step={cell} value={((selectedVoxel[axis] + (axis === 'y' ? 0 : 0.5)) * cell).toFixed(2)}
+                  onChange={(e) => { const n = Number(e.target.value); if (Number.isFinite(n)) updateSelected({ [axis]: Math.round(n / cell - (axis === 'y' ? 0 : 0.5)) }); }}
+                  className="w-full border border-[#ffffff25] bg-[#282a29] px-1 py-1 text-center forge-mono text-[10px]" />
+              </label>)}
+            </div>
+            <div className="mt-2 flex items-center justify-between">
+              <span className="forge-mono text-[9px] text-[#aaa394]">ROTATION · Y</span>
+              <div className="flex items-center gap-1">
+                <button className="fg-btn fg-icon !h-6 !w-6" aria-label="Rotate counterclockwise" onClick={() => updateSelected({ rot: (selectedVoxel.rot + 3) % 4 })}>−</button>
+                <span className="forge-mono min-w-8 text-center text-[10px] text-[#e9b957]">{selectedVoxel.rot * 90}°</span>
+                <button className="fg-btn fg-icon !h-6 !w-6" aria-label="Rotate clockwise" onClick={() => updateSelected({ rot: (selectedVoxel.rot + 1) % 4 })}>+</button>
+              </div>
+            </div>
+            <div className="mt-2 grid grid-cols-3 gap-1">
+              {(['x','y','z'] as const).map((axis) => <div key={axis} className="flex gap-1">
+                <button className="fg-chip flex-1 !px-0" aria-label={`Move ${axis} negative`} onClick={() => updateSelected({ [axis]: selectedVoxel[axis] - 1 })}>−{axis}</button>
+                <button className="fg-chip flex-1 !px-0" aria-label={`Move ${axis} positive`} onClick={() => updateSelected({ [axis]: selectedVoxel[axis] + 1 })}>+{axis}</button>
+              </div>)}
+            </div>
+          </> : <div className="py-2 forge-mono text-[9px] leading-relaxed text-[#aaa394]">Choose Select in the block palette, then click an object. Edit X, Y, Z or rotation here.</div>}
+          <div className="mt-2 flex justify-end border-t border-[#ffffff20] pt-2">
+            <button className="fg-btn fg-icon" title="Reset camera view" onClick={() => stageRef.current?.controls.reset()}><Compass className="h-4 w-4" /></button>
+          </div>
+        </div>
+
+        {/* quick height controls */}
+        <div className="absolute right-[238px] top-3 flex flex-col gap-1 max-sm:right-[188px]">
           <button
             className="fg-btn fg-icon glass"
             title="Reset camera view"
